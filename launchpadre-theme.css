@@ -1,0 +1,118 @@
+/**
+ * LaunchPadre — Minimalist Design Tokens & Theme Configuration
+ * Dark navy bedrock palette, high-contrast panels, and developer-first monospace stacks.
+ */
+
+:root {
+  /* Bedrock & Surface Spaces */
+  --color-bg-base: #070b19;
+  --color-bg-surface: #0b132b;
+  --color-bg-elevated: #111d42;
+  --color-bg-overlay: rgba(7, 11, 25, 0.85);
+
+  /* Hairlines & Structural Dividers */
+  --color-border-subtle: rgba(255, 255, 255, 0.08);
+  --color-border-active: rgba(245, 158, 11, 0.4);
+  --color-border-danger: rgba(244, 63, 94, 0.4);
+
+  /* Tactical Accents */
+  --color-launch-amber: #f59e0b;
+  --color-launch-amber-glow: rgba(245, 158, 11, 0.15);
+  --color-panic-rose: #f43f5e;
+  --color-panic-rose-glow: rgba(244, 63, 94, 0.15);
+  --color-status-success: #10b981;
+  --color-status-info: #38bdf8;
+
+  /* Typography Colors */
+  --color-text-primary: #f8fafc;
+  --color-text-secondary: #cbd5e1;
+  --color-text-muted: #94a3b8;
+  --color-text-dim: #64748b;
+
+  /* Font Stacks */
+  --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: 'Public Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Base resets & typography mapping */
+body {
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Monospace Layout Stacks for Tags, Commit SHAs, & Data Rows */
+code,
+pre,
+kbd,
+samp,
+.font-mono,
+.launchpadre-sha,
+.launchpadre-tag,
+.launchpadre-data-row {
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+}
+
+/* Utility Tokens */
+.bg-launchpadre-base {
+  background-color: var(--color-bg-base);
+}
+
+.bg-launchpadre-surface {
+  background-color: var(--color-bg-surface);
+}
+
+.bg-launchpadre-elevated {
+  background-color: var(--color-bg-elevated);
+}
+
+.text-launch-amber {
+  color: var(--color-launch-amber);
+}
+
+.text-panic-rose {
+  color: var(--color-panic-rose);
+}
+
+.border-launchpadre-subtle {
+  border-color: var(--color-border-subtle);
+}
+
+.border-launchpadre-active {
+  border-color: var(--color-border-active);
+}
+
+.border-launchpadre-danger {
+  border-color: var(--color-border-danger);
+}
+
+/* Precision Tabular Numerals */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbar aesthetic for dense developer view */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-base);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
