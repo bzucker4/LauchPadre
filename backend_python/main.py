@@ -77,15 +77,16 @@ from backend_python.zenodo import (
 # 1. CONFIGURATION & LOCAL-OFFSET STRUCTURED LOGGING
 # ============================================================================
 
+import secrets
+
 class Settings:
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
         "postgresql+asyncpg://launchpadre:launchpadre_secret@localhost:5432/launchpadre_db",
     )
     WEBHOOK_SECRET: str = os.getenv(
-        "WEBHOOK_SECRET",
-        "whsec_launchpadre_forgejo_9f8e7d6c5b4a3f2e1d0c",
-    )
+        "WEBHOOK_SECRET"
+    ) or f"whsec_{secrets.token_hex(20)}"
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
     DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
     DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))

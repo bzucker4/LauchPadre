@@ -19,10 +19,12 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
+import secrets
+
 logger = logging.getLogger("launchpadre.billing")
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "sk_test_launchpadre_mock_secret_key_4092")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "whsec_launchpadre_stripe_webhook_99a8b7c6")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY") or f"sk_test_{secrets.token_hex(20)}"
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET") or f"whsec_{secrets.token_hex(20)}"
 APP_URL = os.getenv("APP_URL", "http://localhost:3000").rstrip("/")
 
 stripe.api_key = STRIPE_SECRET_KEY

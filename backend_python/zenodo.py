@@ -22,10 +22,12 @@ from typing import Any
 import requests
 from pydantic import BaseModel, Field
 
+import secrets
+
 logger = logging.getLogger("launchpadre.zenodo")
 
 ZENODO_BASE_URL = os.getenv("ZENODO_BASE_URL", "https://zenodo.org").rstrip("/")
-ZENODO_ACCESS_TOKEN = os.getenv("ZENODO_ACCESS_TOKEN", "zenodo_pat_test_token_academic_4092")
+ZENODO_ACCESS_TOKEN = os.getenv("ZENODO_ACCESS_TOKEN") or f"zenodo_pat_{secrets.token_hex(16)}"
 
 IGNORED_ARCHIVE_PATTERNS = {
     ".git",

@@ -13,9 +13,9 @@ const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(process.argv[portArgIdx + 1]) : null;
 const PORT = cliPort && !isNaN(cliPort) ? cliPort : 3000;
 const WEBHOOK_SECRET =
-  process.env.WEBHOOK_SECRET || 'whsec_launchpadre_forgejo_9f8e7d6c5b4a3f2e1d0c';
+  process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
 const STRIPE_WEBHOOK_SECRET =
-  process.env.STRIPE_WEBHOOK_SECRET || 'whsec_launchpadre_stripe_webhook_99a8b7c6';
+  process.env.STRIPE_WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
 
 // ============================================================================
 // 1. TIMEZONE FORMATTER & AUDIT LOGGING
@@ -1024,12 +1024,97 @@ async function startServer() {
     }
   });
 
-  // Full state query
-  app.get('/api/v1/state', (_req: Request, res: Response) => {
-    const read = (f: string) => {
-      const p = path.join(__dirname, 'backend_python', f);
-      return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : '';
-    };
+  // Targeted Endpoints for Clean Partial Reads
+  app.get('/api/v1/repositories', (_req: Request, res: Response) => {
+    res.json(db.repositories);
+  });
+
+  app.get('/api/v1/repositories/:repo_id', (req: Request, res: Response) => {
+    const repoId = Number(req.params.repo_id);
+    const repo = db.repositories.find((r) => r.forgejo_repo_id === repoId || r.id === repoId);
+    if (!repo) {
+      res.status(404).json({ error: 'Repo not found' });
+      return;
+    }
+    res.json(repo);
+  });
+
+  app.get('/api/v1/repositories/:repo_id/dois', (req: Request, res: Response) => {
+    const repoId = Number(req.params.repo_id);
+    const repo = db.repositories.find((r) => r.forgejo_repo_id === repoId || r.id === repoId);
+    if (!repo) {
+      res.status(404).json({ error: 'Repo not found' });
+      return;
+    }
+    const dois = db.academic_dois.filter((d) => d.repository_id === repo.id);
+    res.json(dois);
+  });
+
+  app.get('/api/v1/repositories/:repo_id/slop', (req: Request, res: Response) => {
+    const repoId = Number(req.params.repo_id);
+    const repo = db.repositories.find((r) => r.forgejo_repo_id === repoId || r.id === repoId);
+    if (!repo) {
+      res.status(404).json({ error: 'Repo not found' });
+      return;
+    }
+    const slop = db.untracked_slop.filter((s) => s.repository_id === repo.id);
+    res.json(slop);
+  });
+
+  app.get('/api/v1/billing/subscription', (_req: Request, res: Response) => {
+    res.json(db.users[0] || null);
+  });
+
+  app.get('/api/v1/sovereignty/stats', (_req: Request, res: Response) => {
+    const blockedCount = scraperProbeRecords.filter((p) => p.status === 'intercepted_403').length;
+    res.json({
+      blocked_count: blockedCount,
+      recent_probes: scraperProbeRecords.slice(0, 20),
+      banned_signatures: BANNED_AI_SCRAPERS,
+    });
+  });
+
+  // Async file cache to prevent blocking event loop on disk reads
+  const serverFileCache = new Map<string, { mtimeMs: number; content: string }>();
+  async function getAsyncFile(fileName: string): Promise<string> {
+    const safe = path.basename(fileName);
+    const p = path.join(__dirname, 'backend_python', safe);
+    try {
+      const stat = await fs.promises.stat(p);
+      const cached = serverFileCache.get(safe);
+      if (cached && cached.mtimeMs === stat.mtimeMs) {
+        return cached.content;
+      }
+      const content = await fs.promises.readFile(p, 'utf-8');
+      serverFileCache.set(safe, { mtimeMs: stat.mtimeMs, content });
+      return content;
+    } catch {
+      return '';
+    }
+  }
+
+  // On-demand async source file endpoint with mtime caching
+  app.get('/api/v1/source/:filename', async (req: Request, res: Response) => {
+    const fileName = req.params.filename;
+    const content = await getAsyncFile(fileName);
+    if (!content) {
+      res.status(404).json({ error: `File '${fileName}' not found` });
+      return;
+    }
+    res.json({ filename: fileName, content });
+  });
+
+  // Full state query (Non-blocking async)
+  app.get('/api/v1/state', async (req: Request, res: Response) => {
+    const includeFiles = req.query.include_files === 'true';
+    const sourceFiles: Record<string, string> = {};
+    if (includeFiles) {
+      const files = ['main.py', 'models.py', 'panic_room.py', 'billing.py', 'zenodo.py', 'middleware.py', 'schema.sql', 'requirements.txt'];
+      for (const f of files) {
+        sourceFiles[f] = await getAsyncFile(f);
+      }
+    }
+
     res.json({
       users: db.users,
       repositories: db.repositories,
@@ -1041,16 +1126,7 @@ async function startServer() {
       untracked_slop: db.untracked_slop,
       scraper_probes: scraperProbeRecords,
       audit_logs: auditLogs,
-      source_files: {
-        'main.py': read('main.py'),
-        'models.py': read('models.py'),
-        'panic_room.py': read('panic_room.py'),
-        'billing.py': read('billing.py'),
-        'zenodo.py': read('zenodo.py'),
-        'middleware.py': read('middleware.py'),
-        'schema.sql': read('schema.sql'),
-        'requirements.txt': read('requirements.txt'),
-      },
+      source_files: sourceFiles,
     });
   });
 
@@ -1070,7 +1146,7 @@ async function startServer() {
       const url = req.originalUrl;
       try {
         const indexPath = path.resolve(__dirname, 'index.html');
-        let template = fs.readFileSync(indexPath, 'utf-8');
+        let template = await fs.promises.readFile(indexPath, 'utf-8');
         template = await vite.transformIndexHtml(url, template);
         res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
       } catch (e) {
