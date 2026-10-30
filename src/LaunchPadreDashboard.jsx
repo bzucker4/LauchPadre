@@ -204,7 +204,7 @@ export default function LaunchPadreDashboard() {
 
   return (
     <div className="min-h-screen bg-[#070b19] text-slate-100 flex flex-col font-sans selection:bg-amber-500/20 selection:text-amber-200">
-      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Sample repositories use simulated Git operations. Registered local repositories use real Git checkpoints and rollback. Billing and DOI publishing are still simulated.</div>
+      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Sample repositories use simulated Git operations. Registered local repositories use real Git checkpoints and rollback. Stripe checkout and Zenodo archives require server configuration. Publication is a separate confirmed action.</div>
       {/* Top Bar Header */}
       <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-[#070b19]/95 sticky top-0 z-30 backdrop-blur-md">
         <a
@@ -382,7 +382,7 @@ export default function LaunchPadreDashboard() {
           />
         )}
 
-        {activeTab === 'kanban' && <KanbanTab tasks={tasks} />}
+        {activeTab === 'kanban' && <KanbanTab tasks={tasks} currentRepo={currentRepo} onTasksChanged={() => currentRepo && fetchRepoTasks(currentRepo.forgejo_repo_id)} />}
 
         {activeTab === 'source' && <SourceViewerTab />}
       </main>

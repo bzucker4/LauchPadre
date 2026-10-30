@@ -12,6 +12,7 @@ export class GitWorkspace {
       throw new Error('Use a repository path relative to the configured Git root');
     }
     const directory = fs.realpathSync(path.join(this.root, relative));
+    if (directory !== path.resolve(this.root, relative)) throw new Error('Symlink aliases are not supported');
     const contained = path.relative(this.root, directory);
     if (!contained || contained.startsWith('..') || path.isAbsolute(contained)) throw new Error('Repository must stay inside the configured Git root');
     const gitPath = path.join(directory, '.git');
@@ -48,6 +49,15 @@ export class GitWorkspace {
     // No force: an existing checkpoint can never be silently overwritten.
     this.run(directory, ['tag', tag, head]);
     return { tag, head };
+  }
+
+  archive(relative: string, commit: string): Buffer {
+    const directory = this.resolve(relative);
+    if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error('Invalid archive commit');
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+    return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', directory, 'archive', '--format=zip', commit], {
+      timeout: 30_000, maxBuffer: 50 * 1024 * 1024, env, stdio: ['ignore', 'pipe', 'pipe'],
+    });
   }
 
   rollback(relative: string, tag: string, expectedHead: string, expectedTarget: string) {

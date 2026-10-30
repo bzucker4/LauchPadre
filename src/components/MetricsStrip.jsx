@@ -33,7 +33,7 @@ export const MetricsStrip = React.memo(function MetricsStrip({
       </div>
 
       <div className="p-4 bg-[#0b132b] border border-slate-800/90 rounded-lg">
-        <div className="text-xs text-slate-400">Untracked AI Slop in Worktree</div>
+        <div className="text-xs text-slate-400">Workspace file records</div>
         <div
           className={`mt-1 text-base font-semibold font-mono tabular-nums ${
             untrackedSlopCount > 0 ? 'text-rose-400' : 'text-emerald-400'
@@ -41,7 +41,7 @@ export const MetricsStrip = React.memo(function MetricsStrip({
         >
           {untrackedSlopCount} Dangling File(s)
         </div>
-        <div className="mt-1 text-xs text-slate-400 font-mono">Purged via git clean -fd</div>
+        <div className="mt-1 text-xs text-slate-400 font-mono">{currentRepo?.mode === 'live' ? 'Live rollback requires a clean worktree' : 'Demo file records'}</div>
       </div>
 
       <div className="p-4 bg-[#0b132b] border border-slate-800/90 rounded-lg">
@@ -54,3 +54,4 @@ export const MetricsStrip = React.memo(function MetricsStrip({
     </section>
   );
 });
+

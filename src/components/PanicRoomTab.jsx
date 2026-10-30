@@ -137,7 +137,7 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
 
             <button
               type="submit"
-              disabled={isCreatingSnapshot || !snapshotName.trim()}
+              disabled={isCreatingSnapshot || !currentRepo || !snapshotName.trim()}
               className="w-full py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-md transition-colors disabled:opacity-50 cursor-pointer"
             >
               {isCreatingSnapshot ? 'Creating Snapshot...' : 'POST /api/v1/panic/snapshots'}

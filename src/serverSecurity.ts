@@ -10,13 +10,13 @@ export function secretsEqual(left: string, right: string): boolean {
 export function installAuthentication(app: Express) {
   const password = process.env.ADMIN_PASSWORD;
   const production = process.env.NODE_ENV === 'production';
-  if (production && (!password || password.length < 16)) {
+  if ((production || process.env.LAUNCHPADRE_DEMO === 'false') && (!password || password.length < 16)) {
     throw new Error('Production requires ADMIN_PASSWORD with at least 16 characters');
   }
   const enabled = Boolean(password);
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; until: number }>();
-  const cookieName = 'launchpadre_session';
+  const cookieName = production ? '__Host-launchpadre_session' : 'launchpadre_session';
   const tokenOf = (req: Request) => (req.headers.cookie || '').split(';').map(v => v.trim())
     .find(v => v.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1) || '';
   const valid = (req: Request) => (sessions.get(tokenOf(req)) || 0) > Date.now();
@@ -73,7 +73,8 @@ export function installAuthentication(app: Express) {
     res.json({ authenticated: false });
   });
   app.use('/api', (req, res, next) => {
-    if (enabled && !valid(req)) { res.status(401).json({ error: 'Sign in required' }); return; }
+    const signedWebhook = req.method === 'POST' && ['/api/v1/billing/webhooks/stripe', '/api/v1/webhooks/git-core'].includes(req.originalUrl.split('?')[0]);
+    if (enabled && !signedWebhook && !valid(req)) { res.status(401).json({ error: 'Sign in required' }); return; }
     next();
   });
 }

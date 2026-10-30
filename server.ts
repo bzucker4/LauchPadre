@@ -1,3 +1,5 @@
+import { ZenodoClient } from './src/zenodoClient.ts';
+import { StripeClient } from './src/stripeClient.ts';
 import { GitWorkspace } from './src/gitWorkspace.ts';
 import { installAuthentication } from './src/serverSecurity.ts';
 import { StateStore } from './src/stateStore.ts';
@@ -19,8 +21,9 @@ const PORT = cliPort ?? Number(process.env.PORT || 3000);
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT must be an integer between 1 and 65535');
 }
-if (process.env.NODE_ENV === 'production' && process.env.LAUNCHPADRE_DEMO !== 'true') {
-  throw new Error('This server simulates integrations. Set LAUNCHPADRE_DEMO=true only for a demo deployment.');
+const demoMode = process.env.LAUNCHPADRE_DEMO === 'true' || (process.env.NODE_ENV !== 'production' && process.env.LAUNCHPADRE_DEMO !== 'false');
+if (!demoMode && (!process.env.ADMIN_EMAIL || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(process.env.ADMIN_EMAIL))) {
+  throw new Error('Live mode requires ADMIN_EMAIL for the workspace owner');
 }
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
@@ -174,6 +177,8 @@ export interface UserRow {
 }
 
 export interface AcademicDoiRow {
+  status?: 'uploading' | 'upload_failed' | 'draft' | 'publishing' | 'published';
+  environment?: string;
   id: number;
   repository_id: number;
   commit_sha: string;
@@ -259,6 +264,8 @@ export interface TaskCommitLinkRow {
 }
 
 interface RelationalStore {
+  workspace_mode?: 'demo' | 'live';
+  stripe_events?: string[];
   users: UserRow[];
   repositories: RepositoryRow[];
   tasks: TaskRow[];
@@ -491,9 +498,39 @@ function createInitialStore(): RelationalStore {
 }
 
 const stateStore = new StateStore<RelationalStore>(process.env.STATE_DB_PATH || './data/workspace.db');
-let db: RelationalStore = stateStore.load(createInitialStore);
+const initialWorkspace = (): RelationalStore => {
+  const seed = createInitialStore();
+  seed.workspace_mode = demoMode ? 'demo' : 'live';
+  if (!demoMode) {
+    const now = formatLocalIsoOffset();
+    seed.users = [{ id: 1, username: process.env.ADMIN_NAME || 'Workspace owner', email: process.env.ADMIN_EMAIL!,
+      plan: 'free', is_premium: false, stripe_customer_id: null, stripe_subscription_id: null, created_at: now, updated_at: now }];
+    seed.repositories = []; seed.tasks = []; seed.commits = []; seed.task_commit_links = [];
+    seed.academic_dois = []; seed.panic_snapshots = []; seed.untracked_slop = [];
+    seed.counters = { userId: 1, repoId: 0, taskId: 0, commitId: 0, doiId: 0 };
+  }
+  return seed;
+};
+let db: RelationalStore = stateStore.load(initialWorkspace);
+if ((db.workspace_mode || 'demo') !== (demoMode ? 'demo' : 'live')) {
+  throw new Error('Workspace mode does not match the database. Use a separate STATE_DB_PATH for live and demo workspaces.');
+}
 const gitWorkspace = process.env.GIT_REPOSITORIES_ROOT && process.env.ADMIN_PASSWORD
   ? new GitWorkspace(process.env.GIT_REPOSITORIES_ROOT) : null;
+const zenodoClient = process.env.ZENODO_ACCESS_TOKEN && process.env.ADMIN_PASSWORD
+  ? new ZenodoClient(process.env.ZENODO_BASE_URL || 'https://sandbox.zenodo.org', process.env.ZENODO_ACCESS_TOKEN) : null;
+const stripeClient = process.env.STRIPE_SECRET_KEY && process.env.APP_ORIGIN && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD
+  ? new StripeClient(process.env.STRIPE_SECRET_KEY, process.env.APP_ORIGIN, {
+      indie_solo: process.env.STRIPE_PRICE_INDIE || '', academic_tier: process.env.STRIPE_PRICE_ACADEMIC || '',
+    }) : null;
+if (process.env.ADMIN_EMAIL) {
+  const owner = db.users[0];
+  owner.email = process.env.ADMIN_EMAIL; owner.username = process.env.ADMIN_NAME || 'Workspace owner';
+  if (owner.stripe_customer_id?.startsWith('cus_launchpadre_')) {
+    owner.plan = 'free'; owner.is_premium = false; owner.stripe_customer_id = null; owner.stripe_subscription_id = null;
+  }
+  stateStore.save(db);
+}
 
 recordLog(
   'INFO',
@@ -557,7 +594,7 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 async function startServer() {
   const app = express();
 
-  app.get('/healthz', (_req, res) => res.json({ status: 'ok', mode: 'demo' }));
+  app.get('/healthz', (_req, res) => res.json({ status: 'ok', mode: demoMode ? 'demo' : 'live' }));
 
   // Layer B & Layer C Data Sovereignty Middleware
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -576,6 +613,7 @@ async function startServer() {
             client_ip: clientIp,
             path: req.path,
           });
+          if (scraperProbeRecords.length > 500) scraperProbeRecords.length = 500;
           res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
           res.status(403).type('text/plain').send(`403 Forbidden: AI scrapers blocked by LaunchPadre. Matched: ${sig}\n`);
           return;
@@ -626,46 +664,25 @@ async function startServer() {
   // PHASE 3: STRIPE BILLING LIFECYCLE
   // ==========================================================================
 
-  // POST /api/v1/billing/checkout-session
-  app.post('/api/v1/billing/checkout-session', (req: Request, res: Response) => {
-    const userId = Number(req.body?.user_id);
-    const planId = String(req.body?.plan_id || '').trim().toLowerCase();
-
-    const planPrices: Record<string, { name: string; price: number }> = {
-      indie_solo: { name: 'Indie Solo Tier', price: 12 },
-      academic_tier: { name: 'Academic Researcher Tier', price: 29 },
-    };
-
-    if (!planPrices[planId]) {
-      res.status(400).json({ error: `Invalid plan_id '${planId}'. Allowed: indie_solo, academic_tier` });
-      return;
-    }
-
-    const sessionId = `cs_test_${crypto.randomBytes(16).toString('hex')}`;
-    const checkoutUrl = `https://checkout.stripe.com/c/pay/${sessionId}`;
-
-    recordLog(
-      'INFO',
-      'STRIPE_CHECKOUT_CREATED',
-      200,
-      `Created Stripe checkout session ${sessionId} for user #${userId} (${planId}) with client_reference_id='${userId}'`
-    );
-
-    res.json({
-      session_id: sessionId,
-      checkout_url: checkoutUrl,
-      plan_id: planId,
-      plan_name: planPrices[planId].name,
-      amount_usd: planPrices[planId].price,
-      user_id: userId,
-    });
+  app.get('/api/v1/integrations', (_req, res) => {
+    res.json({ mode: demoMode ? 'demo' : 'live', git: Boolean(gitWorkspace), stripe: Boolean(stripeClient), zenodo: Boolean(zenodoClient), zenodo_origin: zenodoClient?.origin || null });
   });
 
-  // POST /api/v1/billing/webhooks/stripe
-  app.post('/api/v1/billing/webhooks/stripe', (req: Request, res: Response) => {
-    const stripeSig = req.header('Stripe-Signature') || '';
+  app.post('/api/v1/billing/checkout-session', async (req: Request, res: Response) => {
+    if (!stripeClient) { res.status(503).json({ error: 'Configure Stripe credentials, prices, ADMIN_EMAIL, and APP_ORIGIN before checkout' }); return; }
+    const user = db.users[0];
+    if (Number(req.body?.user_id) !== user.id) { res.status(403).json({ error: 'Only the workspace owner can subscribe' }); return; }
+    const plan = req.body?.plan_id;
+    if (!['indie_solo', 'academic_tier'].includes(plan)) { res.status(400).json({ error: 'Invalid plan' }); return; }
+    if (user.stripe_subscription_id) { res.status(409).json({ error: 'A subscription already exists. Manage it in Stripe before creating another.' }); return; }
+    try { res.json(await stripeClient.checkout(user, plan)); }
+    catch (error) { res.status(502).json({ error: error instanceof Error ? error.message : 'Checkout failed' }); }
+  });
+
+  app.post('/api/v1/billing/webhooks/stripe', async (req: Request, res: Response) => {
+    if (!process.env.STRIPE_WEBHOOK_SECRET) { res.status(503).json({ error: 'Stripe webhook is not configured' }); return; }
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
-    const parts = stripeSig.split(',').map(part => part.trim().split('='));
+    const parts = (req.header('Stripe-Signature') || '').split(',').map(part => part.trim().split('='));
     const timestamp = parts.find(([key]) => key === 't')?.[1] || '';
     const expected = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(`${timestamp}.`).update(raw).digest('hex');
     const signatures = parts.filter(([key]) => key === 'v1').map(([, value]) => value || '');
@@ -673,132 +690,103 @@ async function startServer() {
         !signatures.some(sig => /^[a-f0-9]{64}$/i.test(sig) && crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(sig, 'hex')))) {
       res.status(401).json({ error: 'Invalid Stripe signature' }); return;
     }
-    let payload: any;
-
+    let event: any;
+    try { event = JSON.parse(raw.toString('utf8')); } catch { res.status(400).json({ error: 'Malformed Stripe JSON' }); return; }
+    if (typeof event?.id !== 'string' || !event?.data?.object) { res.status(400).json({ error: 'Invalid Stripe event' }); return; }
+    const release = await acquireRepoLock(-1);
     try {
-      const rawString = Buffer.isBuffer(req.body) ? req.body.toString('utf-8') : JSON.stringify(req.body || {});
-      payload = JSON.parse(rawString);
-    } catch {
-      res.status(400).json({ error: 'Malformed Stripe webhook JSON payload' });
-      return;
-    }
-
-    const eventType = payload.type || req.body?.type;
-    const eventObject = payload.data?.object || req.body?.data?.object || {};
-
-    if (eventType === 'checkout.session.completed') {
-      const clientRefId = Number(eventObject.client_reference_id || req.body?.user_id || 1);
-      const planId = eventObject.metadata?.plan_id || 'indie_solo';
-      const customerId = eventObject.customer || `cus_${crypto.randomBytes(6).toString('hex')}`;
-      const subId = eventObject.subscription || `sub_${crypto.randomBytes(8).toString('hex')}`;
-
-      const user = db.users.find((u) => u.id === clientRefId) || db.users[0];
-      if (user) {
-        user.plan = planId as any;
-        user.is_premium = true;
-        user.stripe_customer_id = customerId;
-        user.stripe_subscription_id = subId;
-        user.updated_at = formatLocalIsoOffset(new Date());
-
-        recordLog(
-          'INFO',
-          'STRIPE_SUBSCRIPTION_ACTIVATED',
-          200,
-          `Upgraded user #${user.id} ('${user.username}') to ${planId}. Stripe Customer: ${customerId}`
-        );
+      db.stripe_events ||= [];
+      if (db.stripe_events.includes(event.id)) { res.json({ status: 'duplicate' }); return; }
+      const user = db.users[0];
+      const object = event.data.object;
+      if (event.type === 'checkout.session.completed' || event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+        if (!stripeClient) { res.status(503).json({ error: 'Stripe client is not configured' }); return; }
+        const id = event.type === 'checkout.session.completed' ? object.subscription : object.id;
+        const subscription = await stripeClient.subscription(id);
+        const plan = subscription.metadata?.plan_id;
+        const ownerId = Number(subscription.metadata?.user_id);
+        if (ownerId !== user.id || !['indie_solo', 'academic_tier'].includes(plan)) {
+          res.status(400).json({ error: 'Subscription does not belong to this workspace' }); return;
+        }
+        if (user.stripe_subscription_id && user.stripe_subscription_id !== subscription.id) {
+          res.status(409).json({ error: 'Subscription does not match the current workspace subscription' }); return;
+        }
+        const active = ['active', 'trialing'].includes(subscription.status);
+        user.plan = active ? plan : 'free'; user.is_premium = active;
+        user.stripe_customer_id = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
+        user.stripe_subscription_id = subscription.status === 'canceled' ? null : subscription.id;
+        user.updated_at = formatLocalIsoOffset();
       }
-
-      res.json({
-        status: 'user_upgraded_to_premium',
-        event_type: eventType,
-        user_id: user?.id,
-        customer_id: customerId,
-        processed: true,
-      });
-      return;
-    } else if (eventType === 'customer.subscription.deleted') {
-      const customerId = eventObject.customer || req.body?.customer_id;
-      const user = db.users.find((u) => u.stripe_customer_id === customerId) || db.users[0];
-      if (user) {
-        user.plan = 'free';
-        user.is_premium = false;
-        user.stripe_subscription_id = null;
-        user.updated_at = formatLocalIsoOffset(new Date());
-
-        recordLog(
-          'WARNING',
-          'STRIPE_SUBSCRIPTION_DELETED',
-          200,
-          `Downgraded user #${user.id} ('${user.username}') to free tier. Customer: ${customerId}`
-        );
-      }
-
-      res.json({
-        status: 'user_downgraded_to_free',
-        event_type: eventType,
-        customer_id: customerId,
-        processed: true,
-      });
-      return;
-    }
-
-    res.json({ status: 'acknowledged', event_type: eventType, processed: false });
+      db.stripe_events.push(event.id);
+      res.json({ status: 'processed', event_id: event.id });
+    } catch { res.status(502).json({ error: 'Unable to verify subscription state with Stripe' }); }
+    finally { release(); }
   });
 
   // ==========================================================================
   // PHASE 3: ZENODO ACADEMIC DOI MINTING
   // ==========================================================================
 
-  // POST /api/v1/academic/doi/mint
-  app.post('/api/v1/academic/doi/mint', (req: Request, res: Response) => {
-    const repoId = Number(req.body?.repo_id);
-    const repo = db.repositories.find((r) => r.id === repoId || r.forgejo_repo_id === repoId);
-    if (!repo) {
-      res.status(404).json({ error: `Repository '${repoId}' not found.` });
-      return;
-    }
+  // Prepare an unpublished archive. Publication is a separate explicit action.
+  app.post('/api/v1/academic/doi/mint', async (req: Request, res: Response) => {
+    if (!zenodoClient || !gitWorkspace) { res.status(503).json({ error: 'Configure Zenodo and the Git workspace before preparing an archive' }); return; }
+    const repo = db.repositories.find(r => r.id === Number(req.body?.repo_id) || r.forgejo_repo_id === Number(req.body?.repo_id));
+    if (!repo || repo.mode !== 'live' || !repo.local_path) { res.status(400).json({ error: 'Select a registered live repository' }); return; }
+    const title = String(req.body?.title || '').trim();
+    const creator = String(req.body?.creator_name || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const license = String(req.body?.license || '').trim();
+    if (!title || !creator || !description || !/^[a-zA-Z0-9_.-]+$/.test(license)) { res.status(400).json({ error: 'Title, creator, description, and a Zenodo license identifier are required' }); return; }
+    const release = await acquireRepoLock(repo.id);
+    let record: AcademicDoiRow | undefined;
+    try {
+      const { head } = gitWorkspace.inspect(repo.local_path);
+      if (!head) { res.status(409).json({ error: 'Create an initial commit before archiving' }); return; }
+      record = db.academic_dois.find(d => d.repository_id === repo.id && d.commit_sha === head && d.environment === zenodoClient.origin);
+      if (record && ['draft', 'published', 'publishing'].includes(record.status || '')) { res.json(record); return; }
+      const archive = gitWorkspace.archive(repo.local_path, head);
+      if (!record) {
+        const deposition = await zenodoClient.create({ title, upload_type: 'software', description,
+          creators: [{ name: creator, affiliation: String(req.body?.creator_affiliation || '') }], access_right: 'open', license });
+        if (!deposition.id || !/^\d+$/.test(String(deposition.id))) throw new Error('Unexpected Zenodo draft response');
+        record = { id: ++db.counters.doiId, repository_id: repo.id, commit_sha: head, deposition_id: String(deposition.id),
+          doi: '', doi_url: '', badge_url: '', title, archive_filename: `repository-${head}.zip`, archive_size_bytes: archive.length,
+          creator_name: creator, creator_affiliation: String(req.body?.creator_affiliation || ''), minted_at: '',
+          status: 'uploading', environment: zenodoClient.origin };
+        db.academic_dois.push(record);
+        // Retain the remote draft id even if upload later fails.
+        stateStore.save(db);
+      }
+      const deposition = await zenodoClient.get(record.deposition_id);
+      await zenodoClient.upload(deposition, record.archive_filename, archive);
+      record.status = 'draft';
+      res.status(201).json(record);
+    } catch (error) {
+      if (record) { record.status = 'upload_failed'; try { stateStore.save(db); } catch { /* return failure without claiming success */ } }
+      res.status(502).json({ error: error instanceof Error ? error.message : 'Zenodo preparation failed', deposition_id: record?.deposition_id });
+    } finally { release(); }
+  });
 
-    const title = String(req.body?.title || `${repo.full_name} Research Code Archive`);
-    const creatorName = String(req.body?.creator_name || 'Elena Rostova');
-    const creatorAffiliation = String(req.body?.creator_affiliation || 'LaunchPadre Research Lab');
-    const commitSha = String(req.body?.commit_sha || repo.head_commit_sha || '91b7e4d20a8c3f567890123456789abcdef98765');
-
-    db.counters.doiId += 1;
-    const depositionId = String(Math.floor(Math.random() * 9000000 + 1000000));
-    const doi = `10.5281/zenodo.${depositionId}`;
-    const doiUrl = `https://doi.org/${doi}`;
-    const badgeUrl = `https://zenodo.org/badge/DOI/${doi}.svg`;
-    const archiveName = `${repo.name.replace(/[^a-z0-9_-]+/gi, '_')}_${commitSha.slice(0, 8)}.zip`;
-
-    const newDoiRecord: AcademicDoiRow = {
-      id: db.counters.doiId,
-      repository_id: repo.id,
-      commit_sha: commitSha,
-      deposition_id: depositionId,
-      doi,
-      doi_url: doiUrl,
-      badge_url: badgeUrl,
-      title,
-      archive_filename: archiveName,
-      archive_size_bytes: Math.floor(Math.random() * 400000 + 150000),
-      creator_name: creatorName,
-      creator_affiliation: creatorAffiliation,
-      minted_at: formatLocalIsoOffset(new Date()),
-    };
-
-    db.academic_dois.unshift(newDoiRecord);
-
-    recordLog(
-      'INFO',
-      'ZENODO_DOI_MINTED',
-      201,
-      `Minted permanent academic DOI: ${doi} for ${repo.full_name} at commit ${commitSha.slice(0, 8)}`
-    );
-
-    res.status(201).json({
-      ...newDoiRecord,
-      forgejo_repo_id: repo.forgejo_repo_id,
-    });
+  app.post('/api/v1/academic/doi/:id/publish', async (req: Request, res: Response) => {
+    if (!zenodoClient) { res.status(503).json({ error: 'Zenodo is not configured' }); return; }
+    if (req.body?.confirm_publication !== true) { res.status(400).json({ error: 'Explicit publication confirmation is required' }); return; }
+    const record = db.academic_dois.find(d => d.id === Number(req.params.id) && d.environment === zenodoClient.origin);
+    if (!record || !['draft', 'publishing', 'published'].includes(record.status || '')) { res.status(409).json({ error: 'A prepared draft in the configured Zenodo environment is required' }); return; }
+    const release = await acquireRepoLock(record.repository_id);
+    try {
+      let deposition = await zenodoClient.get(record.deposition_id);
+      if (!deposition.submitted && deposition.state !== 'inprogress') {
+        deposition = await zenodoClient.publish(record.deposition_id);
+      }
+      const published = Boolean(deposition.submitted && deposition.metadata?.doi);
+      record.status = published ? 'published' : 'publishing';
+      if (published) {
+        record.doi = deposition.metadata.doi; record.doi_url = `https://doi.org/${record.doi}`;
+        record.badge_url = `${zenodoClient.origin}/badge/DOI/${record.doi}.svg`; record.minted_at = formatLocalIsoOffset();
+      }
+      res.status(published ? 200 : 202).json(record);
+    } catch { res.status(502).json({ error: 'Zenodo publication status is uncertain. Review the saved deposition in Zenodo before retrying.', deposition_id: record.deposition_id }); }
+    finally { release(); }
   });
 
   // GET /api/v1/academic/doi/:repo_id
@@ -1060,6 +1048,7 @@ async function startServer() {
 
   // Phase 1: Webhooks sign preview
   app.post('/api/v1/webhooks/sign-preview', (req: Request, res: Response) => {
+    if (!process.env.WEBHOOK_SECRET) { res.status(503).json({ error: 'Git webhook secret is not configured' }); return; }
     const raw = typeof req.body?.rawPayload === 'string' ? req.body.rawPayload : JSON.stringify(req.body?.payload || {});
     const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(Buffer.from(raw)).digest('hex');
     res.json({ signature: sig });
@@ -1067,6 +1056,7 @@ async function startServer() {
 
   // Phase 1: Ingestion
   app.post('/api/v1/webhooks/git-core', (req: Request, res: Response) => {
+    if (!process.env.WEBHOOK_SECRET) { res.status(503).json({ error: 'Git webhook secret is not configured' }); return; }
     const sig = req.header('X-Gitea-Signature');
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
     if (!sig) {
@@ -1083,7 +1073,37 @@ async function startServer() {
     try { payload = JSON.parse(raw.toString('utf-8')); } catch {
       res.status(400).json({ error: 'Malformed webhook JSON' }); return;
     }
-    res.json({ status: 'committed', repository_id: payload.repository?.id, processed_commits: payload.commits?.length || 0 });
+    const repo = db.repositories.find(r => r.mode === 'live' && (
+      r.full_name === payload?.repository?.full_name || r.forgejo_repo_id === Number(payload?.repository?.id)));
+    if (!repo) { res.status(404).json({ error: 'Webhook repository is not registered' }); return; }
+    if (!Array.isArray(payload?.commits) || payload.commits.length > 1000 || payload.commits.some((c: any) => !c || !/^[a-f0-9]{40,64}$/i.test(c.id || '') || typeof c.message !== 'string')) {
+      res.status(400).json({ error: 'Invalid commit payload' }); return;
+    }
+    let processed = 0;
+    for (const incoming of payload.commits) {
+      if (db.commits.some(c => c.repository_id === repo.id && c.commit_sha === incoming.id)) continue;
+      const now = formatLocalIsoOffset();
+      const commit: CommitRow = { id: ++db.counters.commitId, repository_id: repo.id, commit_sha: incoming.id,
+        message: incoming.message.slice(0, 100_000), author_name: String(incoming.author?.name || ''),
+        author_email: String(incoming.author?.email || ''), committed_at: now, ingested_at: now };
+      db.commits.push(commit); processed++;
+      for (const line of commit.message.split('\n')) {
+        const directive = /^\s*(todo|fix|close):\s*(.{1,240})\s*$/i.exec(line);
+        if (!directive) continue;
+        const action = directive[1].toLowerCase(); const title = directive[2].trim();
+        let task = db.tasks.find(t => t.repository_id === repo.id && t.title.toLowerCase() === title.toLowerCase());
+        if (!task && action === 'todo') {
+          task = { id: ++db.counters.taskId, repository_id: repo.id, title, status: 'todo', markdown_file_path: '', created_at: now, updated_at: now };
+          db.tasks.push(task);
+        }
+        if (task) {
+          if (action !== 'todo') task.status = 'done';
+          task.updated_at = now;
+          db.task_commit_links.push({ task_id: task.id, commit_id: commit.id, action_type: action, linked_at: now });
+        }
+      }
+    }
+    res.json({ status: 'ingested', repository_id: repo.id, processed_commits: processed });
   });
 
   // Phase 1: Kanban tasks
@@ -1105,11 +1125,23 @@ async function startServer() {
     });
   });
 
+  app.post('/api/v1/repositories/:repo_id/tasks', (req: Request, res: Response) => {
+    const repo = db.repositories.find(r => r.id === Number(req.params.repo_id) || r.forgejo_repo_id === Number(req.params.repo_id));
+    if (!repo) { res.status(404).json({ error: 'Repository not found' }); return; }
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (!title || title.length > 240) { res.status(400).json({ error: 'Task title must contain 1–240 characters' }); return; }
+    const now = formatLocalIsoOffset();
+    const task: TaskRow = { id: ++db.counters.taskId, repository_id: repo.id, title, status: 'todo', markdown_file_path: '', created_at: now, updated_at: now };
+    db.tasks.push(task);
+    res.status(201).json(hydrateTask(task, db));
+  });
+
   // PATCH /api/v1/tasks/:task_id/status
   app.patch('/api/v1/tasks/:task_id/status', (req: Request, res: Response) => {
     const task = db.tasks.find((t) => t.id === Number(req.params.task_id));
     if (task) {
-      task.status = req.body?.status;
+      if (!['todo', 'in_progress', 'done'].includes(req.body?.status)) { res.status(400).json({ error: 'Invalid task status' }); return; }
+      task.status = req.body.status; task.updated_at = formatLocalIsoOffset();
       res.json(hydrateTask(task, db));
     } else {
       res.status(404).json({ error: 'Task not found' });
@@ -1194,6 +1226,7 @@ async function startServer() {
   const serverFileCache = new Map<string, { mtimeMs: number; content: string }>();
   async function getAsyncFile(fileName: string): Promise<string> {
     const safe = path.basename(fileName);
+    if (!['main.py', 'models.py', 'panic_room.py', 'billing.py', 'zenodo.py', 'middleware.py', 'schema.sql', 'requirements.txt'].includes(safe)) return '';
     const p = path.join(__dirname, 'backend_python', safe);
     try {
       const stat = await fs.promises.stat(p);
@@ -1251,7 +1284,8 @@ async function startServer() {
     if (db.repositories.some(r => r.mode === 'live')) {
       res.status(409).json({ error: 'Reset is disabled while live repositories are registered' }); return;
     }
-    db = createInitialStore();
+    if (!demoMode) { res.status(409).json({ error: 'State reset is only available in demo mode' }); return; }
+    db = initialWorkspace();
     res.json({ status: 'reset' });
   });
 

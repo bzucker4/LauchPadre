@@ -1,72 +1,120 @@
 # LaunchPadre
 
-A Git workflow dashboard with snapshot, Kanban, billing, source inspection, and academic archive views.
+A single-owner Git workspace with persistent tasks, checkpoint tags, guarded rollback, Stripe subscription checkout, and Zenodo software archives.
 
-## Current status
+## Implemented
 
-The Node application is a **demo**, with seeded users and repositories and SQLite-backed state. Checkout URLs and DOI creation are still simulated. Seeded repositories use simulated snapshots and rollback. Registered local repositories use real Git operations. A green health check means the demo server is running; it does not verify external services. Do not enter real payment information. Keep independent backups of live repositories.
+- Password sign-in, eight-hour server sessions, sign-out, login throttling, and browser-origin checks.
+- SQLite workspace persistence with WAL and full synchronous writes.
+- Registration of existing local Git working repositories, immutable checkpoint tags, and rollback recovery refs.
+- Kanban task creation and status changes; signed Git push webhooks can derive tasks from commit messages.
+- Stripe Checkout API integration with configured recurring prices, signature validation, event deduplication, and authoritative subscription retrieval.
+- Zenodo draft creation and committed-file upload, with publication as a separate confirmed action. Sandbox is the default.
+- Separate demo and live databases, a health endpoint, CI, and automated tests.
 
-The Python backend contains separate implementations for PostgreSQL, GitPython, Stripe, and Zenodo. It is not connected to the Node dashboard server and has not been validated for production. Its presence does not make those integrations live.
+Stripe and Zenodo request behavior is tested with substitutes. Actual account transactions and uploads have not been run. The Dockerfile is provided but has not been built in this workspace.
 
-## Run locally
+## Local setup
 
-Use Node.js 24 and npm.
+Use Node.js 24, npm, and Git.
 
 ```sh
 npm ci
 cp .env.example .env
-# Set ADMIN_PASSWORD in .env to protect the workspace.
+```
+
+Edit `.env` before starting:
+
+| Variable | Purpose |
+| --- | --- |
+| `LAUNCHPADRE_DEMO` | `false` for an empty real workspace; `true` for sample data |
+| `ADMIN_EMAIL` | Required owner email in live mode |
+| `ADMIN_PASSWORD` | At least 16 characters; required in live mode and production |
+| `ADMIN_NAME` | Optional owner display name |
+| `APP_ORIGIN` | Exact browser origin, e.g. `http://localhost:3000` locally |
+| `STATE_DB_PATH` | SQLite file; use different paths for demo and live mode |
+| `GIT_REPOSITORIES_ROOT` | Existing directory containing trusted local repositories |
+
+```sh
 npm run dev
 ```
 
-Open http://localhost:3000. Development and production now use the same Express API. `PORT` changes the listening port. Environment values are loaded from `.env`.
+Open http://localhost:3000 and sign in. Development and production use the same Express API. Optional integrations remain unavailable until their environment variables are configured. Never put credentials in source control.
 
-## Build and run a demo deployment
+For a production process:
 
 ```sh
 npm run lint
 npm run build
-NODE_ENV=production LAUNCHPADRE_DEMO=true npm start
+NODE_ENV=production npm start
 ```
 
-Production startup requires explicit acknowledgment of demo mode. The dashboard displays the same limitation. Set ADMIN_PASSWORD to a unique password of at least 16 characters before production startup. Use HTTPS: production session cookies are Secure and will not work over plain HTTP. Set APP_ORIGIN to the exact external origin (for example https://workspace.example.com). This is a single-owner workspace: the password grants access to all sample records, not separate tenant accounts. Sessions expire after eight hours and are invalidated on restart.
+Production requires HTTPS for its Secure, HttpOnly, SameSite=Strict cookies. Set `APP_ORIGIN` to the actual external HTTPS origin. Put the app behind an HTTPS proxy and keep the application port private. Sessions are invalidated on restart. The owner password grants access to the entire workspace: this is not a multi-tenant SaaS.
 
-`GET /healthz` returns `{ "status": "ok", "mode": "demo" }`. Unknown API paths return JSON 404 responses instead of the frontend HTML.
+## Local Git repositories
+
+Configure `GIT_REPOSITORIES_ROOT`, then register a relative folder from the dashboard. Registration does not clone or push. Bare repositories, linked worktrees, symlink aliases, and paths outside the configured root are rejected. Register only repositories and Git configuration you trust.
+
+Snapshots tag committed HEAD. They exclude uncommitted work and cannot overwrite existing checkpoint tags. Make an initial commit yourself before snapshotting a new repository.
+
+Live rollback requires confirmation and the HEAD displayed by the dashboard. It verifies the snapshot tag still matches its saved commit and rejects dirty, untracked, and ignored files. It saves the previous HEAD under `refs/launchpadre/recovery/<id>` before `git reset --hard`. It never runs `git clean`. The dashboard displays the recovery ref, which you can inspect with Git to recover the previous state.
+
+Use one application process and give it exclusive control of managed worktrees while operations run. Application locks do not coordinate with outside Git processes. Keep independent repository backups. Demo reset is disabled when live repositories are registered.
+
+## Tasks and Git webhooks
+
+Create tasks directly on the Kanban board and change their status using its selector. Tasks are stored in SQLite; manual tasks do not create Markdown files.
+
+For push ingestion, set `WEBHOOK_SECRET` and configure your Git forge to POST to `/api/v1/webhooks/git-core` with an HMAC-SHA256 `X-Gitea-Signature` over the raw request body. The repository must be registered, with a matching repository id or full name. Payloads use the Gitea/Forgejo push format (`repository` and `commits`).
+
+Commit-message directives `todo: Task title` create tasks; `fix: Task title` and `close: Task title` mark matching tasks done. Commits are deduplicated per repository. Ingestion records commit metadata and task links; it does not fetch remote changes into the local checkout. Keep local repositories synchronized separately.
+
+## Stripe
+
+Set `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `APP_ORIGIN`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_INDIE`, and `STRIPE_PRICE_ACADEMIC`. Prices must be existing recurring Stripe Price ids. Start with test credentials. Checkout uses the owner identity and server-controlled return URLs; it never accepts a client-supplied price or redirect origin.
+
+Configure Stripe's webhook endpoint as `/api/v1/billing/webhooks/stripe`, subscribing to `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. The endpoint verifies the raw-body signature and a five-minute timestamp tolerance, retrieves current subscription state, validates workspace metadata, and persists processed event ids. Redirecting back from checkout does not grant a plan. Signed webhook endpoints do not require a browser session.
+
+Manage subscription changes through Stripe. The application does not yet offer a customer billing portal. Final pricing is shown by Stripe. No fabricated checkout URL is returned when configuration is missing.
+
+## Zenodo
+
+Set `ZENODO_ACCESS_TOKEN` and `ZENODO_BASE_URL=https://sandbox.zenodo.org` initially. Use a token with the scopes required for creating/uploading and, if needed, publishing depositions. Production Zenodo uses a separate token and `https://zenodo.org`.
+
+Select a live repository, enter its title, creator, description, and a valid Zenodo license identifier. Preparing an archive creates a draft and uploads a ZIP made with `git archive` from committed HEAD. The application limits archives to 50 MiB and does not include submodule contents. Review committed files for private data and confirm your license choice before uploading.
+
+Review the draft in Zenodo before confirming publication. Publication is a separate endpoint and UI action and may be irreversible. Only an actually submitted record with a DOI is shown as published. An accepted request still in progress is shown as publishing. Failed uploads retain their deposition id so that preparing the same commit retries the existing draft.
+
+External calls can have uncertain outcomes after network failures. Review the existing deposition before retrying; a process failure between remote creation and saving its id can leave an orphan draft. Existing metadata is retained when retrying a saved draft; edit metadata in Zenodo if necessary. One deposition is tracked per repository commit and Zenodo environment.
+
+## Storage and deployment
+
+`STATE_DB_PATH` defaults to `./data/workspace.db`. Mount persistent storage for the database and Git repositories. SQLite stores a versioned workspace document and acknowledges successful mutations after saving. A persistence failure blocks subsequent workspace API access until storage is fixed and the process restarted. Use SQLite-aware backups that account for WAL files.
+
+Run exactly one server process. Do not share the same workspace database among separate application instances. Startup rejects switching a database between demo and live modes; use a new path rather than overwriting existing data.
+
+A multi-stage Dockerfile installs Git, builds the frontend, and runs as the non-root `node` user. Mount writable storage at `/app/data` and `/repositories` and provide configuration through the hosting platform's secret/environment settings. The runtime uses Node 24 and includes `tsx` as a production dependency. Container build and hosting verification remain deployment checks.
+
+`GET /healthz` returns `{ "status": "ok", "mode": "live" }` (or `demo`). It is a process health check, not a validation of Stripe, Zenodo, Git, or disk health. `/api/v1/integrations` reports configuration presence after sign-in; it does not prove credentials are valid.
 
 ## Verification
 
 ```sh
+npm run lint
+npm run build
 npm test
 ```
 
-The smoke test starts the built application on a temporary local port and verifies health, repository loading, snapshot retrieval using the dashboard route, unauthenticated access rejection, sign-in/sign-out, cross-origin mutation rejection, malformed webhook signatures, and unknown API responses. A separate test checks SQLite state survives reopening.
+Tests exercise Git snapshots and recovery, refusal of unsafe worktrees, SQLite reopening, checkout request construction, Zenodo draft/publication separation and host restrictions, and authenticated API smoke tests in demo and live modes. Smoke tests cover registration, snapshots, tasks, signed webhook ingestion and replay handling, session controls, invalid signatures, and API errors.
 
-## Work required before a live product
+## Remaining operational work
 
-- Remove the unused alternative demo backend and reconcile the Python implementation before using it.
-- Add user accounts, repository ownership checks, and per-user authorization if expanding beyond the single-owner workspace.
-- Add remote repository import and background synchronization; local repository registration, snapshots, and guarded rollback are implemented.
-- Replace fabricated checkout sessions with Stripe API calls and validate signed webhook replay handling.
-- Connect Zenodo with sandbox validation before allowing irreversible publication.
-- Expand state migrations and backup/recovery checks; configure deployment secrets and integration tests.
-- Audit the Python backend and reconcile every frontend endpoint and response contract.
+- Supply hosting configuration, a unique owner password, and optional integration credentials privately.
+- Validate Stripe test-mode checkout and subscription lifecycle against your account.
+- Validate Zenodo sandbox upload and publication with a repository you explicitly intend to archive.
+- Build and run the container on the chosen host; verify persistent mounts, HTTPS, backups, restore, and restart behavior.
+- Add remote cloning/synchronization and multi-user tenancy only if needed; neither is implemented.
 
-No license has been selected for this repository. Repository ownership alone does not select MIT or another license.
+The `backend_python` directory is a legacy reference implementation. It is not started by the Node app and has not been validated for production. The dashboard source viewer displays that reference, not the active Node implementation. No repository license has been selected.
 
-## Workspace security and storage
-
-The Node workspace stores its versioned state document in SQLite at `STATE_DB_PATH` (default `./data/workspace.db`). It uses WAL and full synchronous writes; the application acknowledges successful mutations after saving state. Keep the database on persistent storage, run exactly one server process, and use SQLite-aware backups (including WAL handling). Never share one workspace database among independent server instances. Sample users, subscriptions and DOI records remain demonstrations.
-
-With `ADMIN_PASSWORD` set, API routes require an HttpOnly, SameSite=Strict session cookie. Production requires a password; local development without one is intentionally open, so bind access accordingly. Browser mutation origins are checked against `APP_ORIGIN` or the request origin. Login attempts are rate limited in process. Use an HTTPS reverse proxy and keep the application port private.
-
-Webhook routes currently require workspace authentication as well as signatures; external webhook delivery will be connected in the integration phase. Stripe signatures use a five-minute timestamp tolerance. Git HMAC signatures reject malformed lengths and JSON rather than crashing. Event deduplication and real ingestion are still pending.
-
-## Real local Git workspaces
-
-Configure `GIT_REPOSITORIES_ROOT` to an existing directory containing trusted Git working repositories and set `ADMIN_PASSWORD`. Register a relative folder name from the dashboard. Repositories must have a regular local `.git` directory; linked worktrees, bare repositories, path traversal, and escaping symlinks are rejected. Registration does not clone, push, or change the repository.
-
-Live snapshots create immutable tags at committed HEAD. They do not include staged, unstaged, untracked, or ignored files. Empty repositories require an initial commit made by you.
-
-Live rollback requires explicit UI confirmation and the current HEAD, verifies the saved snapshot still matches its tag, and refuses all dirty, untracked, and ignored files. It creates `refs/launchpadre/recovery/<id>` at the previous HEAD before resetting. It never runs `git clean`. The response and dashboard show the recovery ref. Inspect that ref with Git to recover the previous branch state. Reset State and demo file generation are disabled for live repositories.
-
-Give this process exclusive ownership of managed worktrees while operations run. The application lock does not coordinate with external editors, Git processes, or additional app instances. Trust repository configuration and apply OS access controls to the Git root.
+API references: [Stripe Checkout creation](https://docs.stripe.com/api/checkout/sessions/create) and [Zenodo REST API](https://developers.zenodo.org/).
