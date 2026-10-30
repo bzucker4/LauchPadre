@@ -1,3 +1,5 @@
+import { installAuthentication } from './src/serverSecurity.ts';
+import { StateStore } from './src/stateStore.ts';
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
@@ -485,13 +487,14 @@ function createInitialStore(): RelationalStore {
   };
 }
 
-let db: RelationalStore = createInitialStore();
+const stateStore = new StateStore<RelationalStore>(process.env.STATE_DB_PATH || './data/workspace.db');
+let db: RelationalStore = stateStore.load(createInitialStore);
 
 recordLog(
   'INFO',
   'ENGINE_BOOT',
   200,
-  'Initialized LaunchPadre Core Engine: Phases 1, 2 & 3 (Stripe & Zenodo Active)'
+  'Initialized LaunchPadre Core Engine: Phases 1, 2 & 3 (Demo integrations; SQLite state active)'
 );
 
 // Mutex locks per repository
@@ -584,6 +587,30 @@ async function startServer() {
   app.use('/api/v1/billing/webhooks/stripe', express.raw({ type: '*/*', limit: '2mb' }));
   app.use(express.json({ limit: '5mb' }));
 
+  installAuthentication(app);
+
+  let persistenceHealthy = true;
+
+  // Persist successful mutations before acknowledging them to the client.
+  app.use('/api', (req, res, next) => {
+    if (!persistenceHealthy) {
+      res.status(503).json({ error: 'Workspace storage is unavailable. Restart after resolving storage errors.' }); return;
+    }
+    const sendJson = res.json.bind(res);
+    res.json = (body) => {
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && res.statusCode < 400) {
+        try { stateStore.save(db); } catch (error) {
+          persistenceHealthy = false;
+          console.error('Workspace persistence failed', error);
+          res.status(503);
+          return sendJson({ error: 'Workspace could not be saved. Restart the server before retrying.' });
+        }
+      }
+      return sendJson(body);
+    };
+    next();
+  });
+
   // Layer A: robots.txt
   app.get('/robots.txt', (_req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -631,7 +658,16 @@ async function startServer() {
 
   // POST /api/v1/billing/webhooks/stripe
   app.post('/api/v1/billing/webhooks/stripe', (req: Request, res: Response) => {
-    const stripeSig = req.header('Stripe-Signature') || req.header('stripe-signature');
+    const stripeSig = req.header('Stripe-Signature') || '';
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+    const parts = stripeSig.split(',').map(part => part.trim().split('='));
+    const timestamp = parts.find(([key]) => key === 't')?.[1] || '';
+    const expected = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(`${timestamp}.`).update(raw).digest('hex');
+    const signatures = parts.filter(([key]) => key === 'v1').map(([, value]) => value || '');
+    if (!/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > 300 ||
+        !signatures.some(sig => /^[a-f0-9]{64}$/i.test(sig) && crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(sig, 'hex')))) {
+      res.status(401).json({ error: 'Invalid Stripe signature' }); return;
+    }
     let payload: any;
 
     try {
@@ -995,11 +1031,15 @@ async function startServer() {
       return;
     }
     const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex');
-    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig.toLowerCase().replace('sha256=', '')))) {
+    const normalizedSignature = sig.toLowerCase().replace(/^sha256=/, '');
+    if (!/^[a-f0-9]{64}$/.test(normalizedSignature) || !crypto.timingSafeEqual(Buffer.from(digest, 'hex'), Buffer.from(normalizedSignature, 'hex'))) {
       res.status(401).json({ error: 'Signature mismatch' });
       return;
     }
-    const payload = JSON.parse(raw.toString('utf-8'));
+    let payload: any;
+    try { payload = JSON.parse(raw.toString('utf-8')); } catch {
+      res.status(400).json({ error: 'Malformed webhook JSON' }); return;
+    }
     res.json({ status: 'committed', repository_id: payload.repository?.id, processed_commits: payload.commits?.length || 0 });
   });
 

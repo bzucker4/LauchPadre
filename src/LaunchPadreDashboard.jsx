@@ -198,7 +198,7 @@ export default function LaunchPadreDashboard() {
 
   return (
     <div className="min-h-screen bg-[#070b19] text-slate-100 flex flex-col font-sans selection:bg-amber-500/20 selection:text-amber-200">
-      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Demo workspace — sample data. Billing, DOI publishing, and Git rollback are simulated. Changes reset when the server restarts.</div>
+      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Demo workspace — sample data. Billing, DOI publishing, and Git rollback are simulated. Workspace changes are saved on this server.</div>
       {/* Top Bar Header */}
       <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-[#070b19]/95 sticky top-0 z-30 backdrop-blur-md">
         <a
