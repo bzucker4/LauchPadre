@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -11,7 +12,13 @@ const __dirname = path.dirname(__filename);
 // Node Express dev server must strictly bind to port 3000 (or CLI --port).
 const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(process.argv[portArgIdx + 1]) : null;
-const PORT = cliPort && !isNaN(cliPort) ? cliPort : 3000;
+const PORT = cliPort ?? Number(process.env.PORT || 3000);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT must be an integer between 1 and 65535');
+}
+if (process.env.NODE_ENV === 'production' && process.env.LAUNCHPADRE_DEMO !== 'true') {
+  throw new Error('This server simulates integrations. Set LAUNCHPADRE_DEMO=true only for a demo deployment.');
+}
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
 const STRIPE_WEBHOOK_SECRET =
@@ -542,6 +549,8 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 async function startServer() {
   const app = express();
 
+  app.get('/healthz', (_req, res) => res.json({ status: 'ok', mode: 'demo' }));
+
   // Layer B & Layer C Data Sovereignty Middleware
   app.use((req: Request, res: Response, next: NextFunction) => {
     const userAgent = (req.header('user-agent') || '').toLowerCase().trim();
@@ -913,7 +922,7 @@ async function startServer() {
   });
 
   // GET /api/v1/panic/snapshots/:repo_id
-  app.get('/api/v1/panic/snapshots/:repo_id', (req: Request, res: Response) => {
+  app.get(['/api/v1/panic/snapshots/:repo_id', '/api/v1/repositories/:repo_id/snapshots'], (req: Request, res: Response) => {
     const repoIdParam = Number(req.params.repo_id);
     const repo = db.repositories.find((r) => r.forgejo_repo_id === repoIdParam || r.id === repoIdParam);
     if (!repo) {
@@ -1136,6 +1145,8 @@ async function startServer() {
     res.json({ status: 'reset' });
   });
 
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found' }));
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
@@ -1165,3 +1176,4 @@ async function startServer() {
 }
 
 startServer();
+
