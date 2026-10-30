@@ -1,3 +1,4 @@
+import { GitWorkspace } from './src/gitWorkspace.ts';
 import { installAuthentication } from './src/serverSecurity.ts';
 import { StateStore } from './src/stateStore.ts';
 import 'dotenv/config';
@@ -215,6 +216,8 @@ export interface UntrackedSlopItem {
 export type TaskStatus = 'todo' | 'in_progress' | 'done';
 
 export interface RepositoryRow {
+  local_path?: string;
+  mode?: 'demo' | 'live';
   id: number;
   owner_id: number;
   forgejo_repo_id: number;
@@ -489,6 +492,8 @@ function createInitialStore(): RelationalStore {
 
 const stateStore = new StateStore<RelationalStore>(process.env.STATE_DB_PATH || './data/workspace.db');
 let db: RelationalStore = stateStore.load(createInitialStore);
+const gitWorkspace = process.env.GIT_REPOSITORIES_ROOT && process.env.ADMIN_PASSWORD
+  ? new GitWorkspace(process.env.GIT_REPOSITORIES_ROOT) : null;
 
 recordLog(
   'INFO',
@@ -830,6 +835,26 @@ async function startServer() {
     const releaseLock = await acquireRepoLock(repo.id);
 
     try {
+      if (repo.mode === 'live' && repo.local_path) {
+        if (!gitWorkspace) { res.status(503).json({ error: 'Git workspace is not configured' }); return; }
+        const sanitized = sanitizeSnapshotName(customSnapshotName);
+        try {
+          const result = gitWorkspace.snapshot(repo.local_path, sanitized);
+          const now = formatLocalIsoOffset();
+          const snapshot: PanicSnapshot = {
+            id: crypto.randomUUID(), repository_id: repo.id, forgejo_repo_id: repo.forgejo_repo_id,
+            tag_name: result.tag, sanitized_name: sanitized, target_commit_sha: result.head,
+            commit_message: 'Live Git checkpoint', author_name: 'Workspace owner', author_email: '',
+            created_at: now, is_head_commit: true, message: String(req.body?.message || ''),
+          };
+          repo.head_commit_sha = result.head; repo.is_unborn_head = false; repo.updated_at = now;
+          db.panic_snapshots.unshift(snapshot);
+          res.status(201).json({ ...snapshot, mode: 'live' });
+        } catch (error) {
+          res.status(409).json({ error: error instanceof Error ? error.message : 'Git snapshot failed' });
+        }
+        return;
+      }
       // TASK 1: UNBORN HEAD SYSTEM RESILIENCY PATCH
       if (repo.is_unborn_head || !repo.head_commit_sha) {
         db.counters.commitId += 1;
@@ -926,6 +951,23 @@ async function startServer() {
         return;
       }
 
+      if (repo.mode === 'live' && repo.local_path) {
+        if (!gitWorkspace) { res.status(503).json({ error: 'Git workspace is not configured' }); return; }
+        if (req.body?.confirm !== true || typeof req.body?.expected_head !== 'string') {
+          res.status(400).json({ error: 'Live rollback requires confirmation and the current HEAD' }); return;
+        }
+        try {
+          const result = gitWorkspace.rollback(repo.local_path, snapshot.tag_name, req.body.expected_head, snapshot.target_commit_sha);
+          repo.head_commit_sha = result.target; repo.updated_at = formatLocalIsoOffset();
+          res.json({ status: 'rolled_back', mode: 'live', repository_id: repo.id,
+            tag_name: snapshot.tag_name, target_commit_sha: result.target, previous_head_sha: result.previousHead,
+            recovery_ref: result.recoveryRef, purged_untracked_count: 0, purged_entries: [], executed_at: formatLocalIsoOffset(),
+          });
+        } catch (error) {
+          res.status(409).json({ error: error instanceof Error ? error.message : 'Git rollback failed' });
+        }
+        return;
+      }
       const previousHeadSha = repo.head_commit_sha;
       repo.head_commit_sha = snapshot.target_commit_sha;
       repo.updated_at = formatLocalIsoOffset(new Date());
@@ -973,6 +1015,7 @@ async function startServer() {
   app.post('/api/v1/panic/slop/generate', (req: Request, res: Response) => {
     const repoId = Number(req.body?.repo_id) || 1;
     const repo = db.repositories.find((r) => r.id === repoId || r.forgejo_repo_id === repoId) || db.repositories[0];
+    if (repo.mode === 'live') { res.status(409).json({ error: 'Demo file generation is disabled for live repositories' }); return; }
     const pathName = `src/broken_ai_slop_${Date.now().toString().slice(-4)}.py`;
     const slop: UntrackedSlopItem = {
       id: `slop_${Date.now()}`,
@@ -1074,6 +1117,23 @@ async function startServer() {
   });
 
   // Targeted Endpoints for Clean Partial Reads
+  app.post('/api/v1/repositories', (req: Request, res: Response) => {
+    if (!gitWorkspace) { res.status(503).json({ error: 'Configure ADMIN_PASSWORD and GIT_REPOSITORIES_ROOT before registering live repositories' }); return; }
+    const relative = req.body?.local_path;
+    if (typeof relative !== 'string' || !relative.trim()) { res.status(400).json({ error: 'local_path is required' }); return; }
+    if (db.repositories.some(r => r.local_path === relative)) { res.status(409).json({ error: 'Repository is already registered' }); return; }
+    try {
+      const info = gitWorkspace.inspect(relative);
+      const now = formatLocalIsoOffset();
+      const id = ++db.counters.repoId;
+      const repo: RepositoryRow = { id, forgejo_repo_id: id, owner_id: 1, mode: 'live', local_path: relative,
+        name: path.basename(relative), full_name: relative, default_branch: info.branch, head_commit_sha: info.head,
+        is_unborn_head: info.unborn, created_at: now, updated_at: now };
+      db.repositories.push(repo);
+      res.status(201).json(repo);
+    } catch { res.status(400).json({ error: 'Repository is not a supported Git working directory inside the configured root' }); }
+  });
+
   app.get('/api/v1/repositories', (_req: Request, res: Response) => {
     res.json(db.repositories);
   });
@@ -1084,6 +1144,13 @@ async function startServer() {
     if (!repo) {
       res.status(404).json({ error: 'Repo not found' });
       return;
+    }
+    if (repo.mode === 'live' && repo.local_path) {
+      if (!gitWorkspace) { res.status(503).json({ error: 'Git workspace is not configured' }); return; }
+      try {
+        const info = gitWorkspace.inspect(repo.local_path);
+        repo.head_commit_sha = info.head; repo.is_unborn_head = info.unborn; repo.default_branch = info.branch;
+      } catch { res.status(409).json({ error: 'Git working directory is unavailable' }); return; }
     }
     res.json(repo);
   });
@@ -1181,6 +1248,9 @@ async function startServer() {
 
   // State reset
   app.post('/api/v1/state/reset', (_req: Request, res: Response) => {
+    if (db.repositories.some(r => r.mode === 'live')) {
+      res.status(409).json({ error: 'Reset is disabled while live repositories are registered' }); return;
+    }
     db = createInitialStore();
     res.json({ status: 'reset' });
   });

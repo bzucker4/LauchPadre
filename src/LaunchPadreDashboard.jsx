@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { RotateCcw, AlertTriangle } from 'lucide-react';
+import { RepositoryRegistration } from './components/RepositoryRegistration.jsx';
 import { MetricsStrip } from './components/MetricsStrip';
 import { PanicRoomTab } from './components/PanicRoomTab';
 import { ZenodoTab } from './components/ZenodoTab';
@@ -26,6 +27,7 @@ export default function LaunchPadreDashboard() {
   // Action status
   const [isExecutingRollback, setIsExecutingRollback] = useState(false);
   const [rollbackOutcome, setRollbackOutcome] = useState(null);
+  const [actionError, setActionError] = useState('');
 
   // 1. Initial Load: Repositories, Active User, Sovereignty Stats
   const fetchGlobalMetadata = useCallback(async () => {
@@ -159,6 +161,8 @@ export default function LaunchPadreDashboard() {
   const handleRollback = useCallback(
     async (snapshotName) => {
       if (!currentRepo) return;
+      if (currentRepo.mode === 'live' && !window.confirm(`Restore ${currentRepo.name} to ${snapshotName}? This moves the current branch. A recovery ref will preserve the old HEAD. The worktree must be completely clean.`)) return;
+      setActionError('');
       setIsExecutingRollback(true);
       try {
         const res = await fetch('/api/v1/panic/rollback', {
@@ -167,6 +171,8 @@ export default function LaunchPadreDashboard() {
           body: JSON.stringify({
             repo_id: currentRepo.forgejo_repo_id,
             snapshot_name: snapshotName,
+            confirm: currentRepo.mode === 'live',
+            expected_head: currentRepo.head_commit_sha,
           }),
         });
         const data = await res.json();
@@ -178,8 +184,8 @@ export default function LaunchPadreDashboard() {
             fetchRepoSnapshots(currentRepo.forgejo_repo_id),
             fetchRepoSlop(currentRepo.forgejo_repo_id),
           ]);
-        }
-      } finally {
+        } else { setActionError(data.error || 'Rollback failed'); }
+      } catch { setActionError('Unable to reach the server'); } finally {
         setIsExecutingRollback(false);
       }
     },
@@ -198,7 +204,7 @@ export default function LaunchPadreDashboard() {
 
   return (
     <div className="min-h-screen bg-[#070b19] text-slate-100 flex flex-col font-sans selection:bg-amber-500/20 selection:text-amber-200">
-      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Demo workspace — sample data. Billing, DOI publishing, and Git rollback are simulated. Workspace changes are saved on this server.</div>
+      <div role="status" className="px-6 py-2 bg-amber-950 text-amber-200 text-sm">Sample repositories use simulated Git operations. Registered local repositories use real Git checkpoints and rollback. Billing and DOI publishing are still simulated.</div>
       {/* Top Bar Header */}
       <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-[#070b19]/95 sticky top-0 z-30 backdrop-blur-md">
         <a
@@ -290,7 +296,7 @@ export default function LaunchPadreDashboard() {
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  {repo.name}{' '}
+                  {repo.name}{repo.mode === 'live' ? ' · Live' : ' · Demo'}{' '}
                   {repo.is_unborn_head ? (
                     <span className="text-amber-400 text-[11px] font-mono">(Unborn HEAD)</span>
                   ) : (
@@ -311,6 +317,8 @@ export default function LaunchPadreDashboard() {
           </div>
         </section>
 
+        <RepositoryRegistration onRegistered={async (repo) => { await fetchGlobalMetadata(); setSelectedRepoId(repo.forgejo_repo_id); }} />
+        {actionError && <p role="alert" className="p-3 text-red-300">{actionError}</p>}
         {/* 4-Column Quantitative KPI Strip (Memoized) */}
         <MetricsStrip
           currentRepo={currentRepo}

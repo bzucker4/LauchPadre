@@ -12,12 +12,14 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
 }) {
   const [snapshotName, setSnapshotName] = useState('pre_assistant_refactor');
   const [snapshotNote, setSnapshotNote] = useState('Baseline checkpoint prior to autonomous agent session');
+  const [error, setError] = useState('');
   const [isCreatingSnapshot, setIsCreatingSnapshot] = useState(false);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!currentRepo || !snapshotName.trim()) return;
 
+    setError('');
     setIsCreatingSnapshot(true);
     try {
       const res = await fetch('/api/v1/panic/snapshots', {
@@ -32,8 +34,8 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
       if (res.ok) {
         setSnapshotName(`checkpoint_${Date.now().toString().slice(-4)}`);
         onSnapshotCreated();
-      }
-    } finally {
+      } else { const result = await res.json(); setError(result.error || 'Snapshot failed'); }
+    } catch { setError('Unable to reach the server'); } finally {
       setIsCreatingSnapshot(false);
     }
   };
@@ -50,7 +52,9 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
 
   return (
     <section className="space-y-6">
-      {currentRepo?.is_unborn_head && (
+      {error && <p role="alert" className="text-red-300">{error}</p>}
+      {currentRepo?.mode === 'live' && <p className="p-3 border border-amber-700 text-amber-200">Live repository. Snapshots tag committed HEAD only. Commit your changes first. Rollback requires a completely clean worktree and preserves a recovery ref; no file cleanup is performed.</p>}
+      {currentRepo?.is_unborn_head && currentRepo?.mode !== 'live' && (
         <div className="p-4 bg-amber-950/20 border border-amber-700/60 rounded-lg flex items-start justify-between gap-4">
           <div className="space-y-1">
             <div className="text-sm font-semibold text-amber-300 flex items-center gap-2">
@@ -64,12 +68,13 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
         </div>
       )}
 
+      {rollbackOutcome?.recovery_ref && <p className="text-emerald-300 font-mono break-all">Previous HEAD retained at {rollbackOutcome.recovery_ref}</p>}
       {rollbackOutcome && (
         <div className="p-5 bg-rose-950/20 border border-rose-800/80 rounded-lg space-y-3">
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold text-rose-300 flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
-              <span>Emergency Hard Reset Executed: Clean Worktree Restored</span>
+              <span>Rollback completed</span>
             </div>
             <span className="text-xs font-mono text-slate-400">{rollbackOutcome.executed_at}</span>
           </div>
@@ -83,9 +88,9 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
               <span className="text-slate-200">{rollbackOutcome.target_commit_sha}</span>
             </div>
             <div className="p-3 bg-slate-950 border border-slate-800 rounded">
-              <span className="text-slate-400 block">Wiped Untracked Slop:</span>
+              <span className="text-slate-400 block">Untracked files removed:</span>
               <span className="text-rose-400 font-semibold">
-                {rollbackOutcome.purged_untracked_count} items purged via git clean -fd
+                {rollbackOutcome.purged_untracked_count} items
               </span>
             </div>
           </div>
@@ -209,3 +214,4 @@ export const PanicRoomTab = React.memo(function PanicRoomTab({
     </section>
   );
 });
+

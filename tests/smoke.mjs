@@ -1,8 +1,8 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -12,8 +12,13 @@ await once(socket, 'listening');
 const port = socket.address().port;
 await new Promise(resolve => socket.close(resolve));
 const directory = await mkdtemp(path.join(tmpdir(), 'launchpadre-smoke-'));
+const project = path.join(directory, 'project');
+await mkdir(project);
+const git = (...args) => execFileSync('git', ['-C', project, ...args], { encoding: 'utf8' }).trim();
+git('init', '-q'); git('config', 'user.name', 'Smoke'); git('config', 'user.email', 'smoke@example.com');
+await writeFile(path.join(project, 'file.txt'), 'baseline'); git('add', '.'); git('commit', '-qm', 'baseline');
 const child = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
-  env: { ...process.env, NODE_ENV: 'production', LAUNCHPADRE_DEMO: 'true', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db') },
+  env: { ...process.env, NODE_ENV: 'production', LAUNCHPADRE_DEMO: 'true', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db'), GIT_REPOSITORIES_ROOT: directory },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
@@ -53,6 +58,17 @@ try {
   assert.equal(crossSite.status, 403);
   const badSignature = await signedFetch(`${base}/api/v1/webhooks/git-core`, { method: 'POST', headers: { 'X-Gitea-Signature': 'short' }, body: '{}' });
   assert.equal(badSignature.status, 401);
+  const post = (route, body) => signedFetch(`${base}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal((await post('/api/v1/repositories', { local_path: '../outside' })).status, 400);
+  const registration = await post('/api/v1/repositories', { local_path: 'project' });
+  assert.equal(registration.status, 201);
+  const live = await registration.json();
+  assert.equal(live.mode, 'live');
+  const snapshot = await post('/api/v1/panic/snapshots', { repo_id: live.id, snapshot_name: 'smoke' });
+  assert.equal(snapshot.status, 201);
+  assert.equal((await snapshot.json()).target_commit_sha, git('rev-parse', 'HEAD'));
+  assert.equal((await post('/api/v1/panic/rollback', { repo_id: live.id, snapshot_name: 'smoke' })).status, 400);
+  assert.equal((await post('/api/v1/state/reset', {})).status, 409);
   const badStripe = await signedFetch(`${base}/api/v1/billing/webhooks/stripe`, { method: 'POST', body: '{}' });
   assert.equal(badStripe.status, 401);
   await signedFetch(`${base}/api/auth/logout`, { method: 'POST' });
