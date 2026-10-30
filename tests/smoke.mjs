@@ -8,6 +8,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const liveMode = process.argv.includes('--live');
+const localOnly = process.argv.includes('--local');
 const socket = createServer();
 socket.listen(0, '127.0.0.1');
 await once(socket, 'listening');
@@ -20,7 +21,7 @@ const git = (...args) => execFileSync('git', ['-C', project, ...args], { encodin
 git('init', '-q'); git('config', 'user.name', 'Smoke'); git('config', 'user.email', 'smoke@example.com');
 await writeFile(path.join(project, 'file.txt'), 'baseline'); git('add', '.'); git('commit', '-qm', 'baseline');
 const child = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
-  env: { ...process.env, NODE_ENV: 'production', LAUNCHPADRE_DEMO: liveMode ? 'false' : 'true', ADMIN_EMAIL: 'owner@example.com', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db'), GIT_REPOSITORIES_ROOT: directory, STRIPE_WEBHOOK_SECRET: 'test-webhook-secret', WEBHOOK_SECRET: 'test-git-secret' },
+  env: { ...process.env, NODE_ENV: 'production', LOCAL_ONLY: localOnly ? 'true' : 'false', LAUNCHPADRE_DEMO: liveMode ? 'false' : 'true', ADMIN_EMAIL: 'owner@example.com', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db'), GIT_REPOSITORIES_ROOT: directory, STRIPE_WEBHOOK_SECRET: 'test-webhook-secret', WEBHOOK_SECRET: 'test-git-secret' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
@@ -43,7 +44,7 @@ try {
   const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'smoke-test-password-12345' }) });
   assert.equal(login.status, 200);
   assert.ok(login.headers.get('set-cookie').includes('HttpOnly'));
-  assert.ok(login.headers.get('set-cookie').includes('Secure'));
+  assert.equal(login.headers.get('set-cookie').includes('Secure'), !localOnly);
   assert.ok(login.headers.get('set-cookie').includes('SameSite=Strict'));
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const signedFetch = (url, options = {}) => fetch(url, { ...options, headers: { ...options.headers, cookie } });

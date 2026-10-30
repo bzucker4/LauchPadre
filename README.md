@@ -14,6 +14,26 @@ A single-owner Git workspace with persistent tasks, checkpoint tags, guarded rol
 
 Stripe and Zenodo request behavior is tested with substitutes. Actual account transactions and uploads have not been run. The Dockerfile is provided but has not been built in this workspace.
 
+## Run on your own computer
+
+Install Node.js 24 and Git first. Clone the implementation branch, then use the local setup commands:
+
+```sh
+git clone --branch codex/production-readiness https://github.com/bzucker4/LauchPadre.git
+cd LauchPadre
+npm ci
+npm run setup:local
+npm run local
+```
+
+Setup asks for your email and the folder containing your Git projects. Your email is just the local owner identity; setup does not send email. It generates a password and saves configuration in `.env`, without overwriting an existing file. Keep the displayed password for sign-in. If `.env` already exists, edit it using `.env.example` as a reference instead of rerunning setup.
+
+Open **http://127.0.0.1:3000** after the server reports it is ready. `npm run local` builds the frontend and starts a production process in local-only mode. It binds to `127.0.0.1`, uses cookies appropriate for local HTTP, and leaves the password requirement in place. Network deployments keep HTTPS-only cookies. Stop with Ctrl+C; start again with `npm run local`. Your database remains at `data/local-workspace.db`.
+
+The default project folder is `repositories` inside the application folder. You can choose an existing folder instead. Clone or put your Git working repositories in that folder and register them by relative name in the dashboard. The local database, Git project folder, and `.env` are excluded from source control.
+
+This setup has no cloud hosting bill. Your computer must be awake and the server running to use it. Its loopback address is not a public website: outside Stripe and Git webhook senders cannot reach it directly. Stripe/Zenodo are optional and can stay unconfigured for local Git and task use. Do not enable port forwarding or expose local-only HTTP mode to the internet.
+
 ## Local setup
 
 Use Node.js 24, npm, and Git.

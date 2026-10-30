@@ -14,13 +14,14 @@ export function installAuthentication(app: Express) {
     throw new Error('Production requires ADMIN_PASSWORD with at least 16 characters');
   }
   const enabled = Boolean(password);
+  const secureCookies = production && process.env.LOCAL_ONLY !== 'true';
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; until: number }>();
-  const cookieName = production ? '__Host-launchpadre_session' : 'launchpadre_session';
+  const cookieName = secureCookies ? '__Host-launchpadre_session' : 'launchpadre_session';
   const tokenOf = (req: Request) => (req.headers.cookie || '').split(';').map(v => v.trim())
     .find(v => v.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1) || '';
   const valid = (req: Request) => (sessions.get(tokenOf(req)) || 0) > Date.now();
-  const options = { httpOnly: true, secure: production, sameSite: 'strict' as const, path: '/' };
+  const options = { httpOnly: true, secure: secureCookies, sameSite: 'strict' as const, path: '/' };
 
   app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');

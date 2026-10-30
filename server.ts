@@ -18,6 +18,8 @@ const __dirname = path.dirname(__filename);
 const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(process.argv[portArgIdx + 1]) : null;
 const PORT = cliPort ?? Number(process.env.PORT || 3000);
+const localOnly = process.env.LOCAL_ONLY === 'true';
+if (localOnly) process.env.APP_ORIGIN = `http://127.0.0.1:${PORT}`;
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT must be an integer between 1 and 65535');
 }
@@ -1314,8 +1316,8 @@ async function startServer() {
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LaunchPadre Phase 2 Engine listening on port ${PORT}`);
+  app.listen(PORT, localOnly ? '127.0.0.1' : '0.0.0.0', () => {
+    console.log(localOnly ? `LaunchPadre is ready at http://127.0.0.1:${PORT}` : `LaunchPadre listening on port ${PORT}`);
   });
 }
 
