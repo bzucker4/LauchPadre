@@ -48,6 +48,9 @@ try {
   assert.ok(login.headers.get('set-cookie').includes('SameSite=Strict'));
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const signedFetch = (url, options = {}) => fetch(url, { ...options, headers: { ...options.headers, cookie } });
+  const plans = await (await signedFetch(`${base}/api/v1/billing/plans`)).json();
+  assert.equal(plans.plans.find(plan => plan.id === 'indie_solo').monthly, 500);
+  assert.equal(plans.plans.find(plan => plan.id === 'academic_tier').annual, 6900);
   const repos = await (await signedFetch(`${base}/api/v1/repositories`)).json();
   if (liveMode) { assert.equal(repos.length, 0); } else {
     assert.ok(repos.length > 0);
@@ -84,6 +87,15 @@ try {
   const snapshot = await post('/api/v1/panic/snapshots', { repo_id: live.id, snapshot_name: 'smoke' });
   assert.equal(snapshot.status, 201);
   assert.equal((await snapshot.json()).target_commit_sha, git('rev-parse', 'HEAD'));
+  assert.equal((await post('/api/v1/panic/snapshots', { repo_id: live.id, snapshot_name: 'second' })).status, 402);
+  for (const name of ['second-project', 'third-project']) {
+    const folder = path.join(directory, name); await mkdir(folder);
+    execFileSync('git', ['-C', folder, 'init', '-q']);
+    assert.equal((await post('/api/v1/repositories', { local_path: name })).status, 201);
+  }
+  assert.equal((await post('/api/v1/repositories', { local_path: 'fourth-project' })).status, 402);
+  assert.equal((await post('/api/v1/academic/doi/mint', {})).status, 402);
+  assert.equal((await post('/api/v1/academic/doi/1/publish', { confirm_publication: true })).status, 402);
   assert.equal((await post('/api/v1/panic/rollback', { repo_id: live.id, snapshot_name: 'smoke' })).status, 400);
   assert.equal((await post('/api/v1/state/reset', {})).status, 409);
   const badStripe = await signedFetch(`${base}/api/v1/billing/webhooks/stripe`, { method: 'POST', body: '{}' });
@@ -102,3 +114,4 @@ try {
   if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
   await rm(directory, { recursive: true, force: true });
 }
+

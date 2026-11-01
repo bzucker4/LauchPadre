@@ -1,3 +1,4 @@
+import { PLANS, effectivePlan, repositoryLimitReached, snapshotLimitReached } from './src/plans.ts';
 import { ZenodoClient } from './src/zenodoClient.ts';
 import { StripeClient } from './src/stripeClient.ts';
 import { GitWorkspace } from './src/gitWorkspace.ts';
@@ -524,6 +525,7 @@ const zenodoClient = process.env.ZENODO_ACCESS_TOKEN && process.env.ADMIN_PASSWO
 const stripeClient = process.env.STRIPE_SECRET_KEY && process.env.APP_ORIGIN && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD
   ? new StripeClient(process.env.STRIPE_SECRET_KEY, process.env.APP_ORIGIN, {
       indie_solo: process.env.STRIPE_PRICE_INDIE || '', academic_tier: process.env.STRIPE_PRICE_ACADEMIC || '',
+      indie_solo_year: process.env.STRIPE_PRICE_INDIE_ANNUAL || '', academic_tier_year: process.env.STRIPE_PRICE_ACADEMIC_ANNUAL || '',
     }) : null;
 if (process.env.ADMIN_EMAIL) {
   const owner = db.users[0];
@@ -670,6 +672,12 @@ async function startServer() {
     res.json({ mode: demoMode ? 'demo' : 'live', git: Boolean(gitWorkspace), stripe: Boolean(stripeClient), zenodo: Boolean(zenodoClient), zenodo_origin: zenodoClient?.origin || null });
   });
 
+  app.get('/api/v1/billing/plans', (_req, res) => {
+    res.json({ currency: 'USD', plans: Object.entries(PLANS).map(([id, plan]) => ({ id, ...plan,
+      monthly_checkout: Boolean(stripeClient?.priceId(id, 'month')), annual_checkout: Boolean(stripeClient?.priceId(id, 'year')),
+    })) });
+  });
+
   app.post('/api/v1/billing/checkout-session', async (req: Request, res: Response) => {
     if (!stripeClient) { res.status(503).json({ error: 'Configure Stripe credentials, prices, ADMIN_EMAIL, and APP_ORIGIN before checkout' }); return; }
     const user = db.users[0];
@@ -677,7 +685,9 @@ async function startServer() {
     const plan = req.body?.plan_id;
     if (!['indie_solo', 'academic_tier'].includes(plan)) { res.status(400).json({ error: 'Invalid plan' }); return; }
     if (user.stripe_subscription_id) { res.status(409).json({ error: 'A subscription already exists. Manage it in Stripe before creating another.' }); return; }
-    try { res.json(await stripeClient.checkout(user, plan)); }
+    const interval = req.body?.billing_interval ?? 'month';
+    if (!['month', 'year'].includes(interval)) { res.status(400).json({ error: 'Invalid billing interval' }); return; }
+    try { res.json(await stripeClient.checkout(user, plan, interval)); }
     catch (error) { res.status(502).json({ error: error instanceof Error ? error.message : 'Checkout failed' }); }
   });
 
@@ -731,6 +741,7 @@ async function startServer() {
 
   // Prepare an unpublished archive. Publication is a separate explicit action.
   app.post('/api/v1/academic/doi/mint', async (req: Request, res: Response) => {
+    if (!PLANS[effectivePlan(db.users[0])].zenodo) { res.status(402).json({ error: 'Zenodo archives require the Academic Researcher plan' }); return; }
     if (!zenodoClient || !gitWorkspace) { res.status(503).json({ error: 'Configure Zenodo and the Git workspace before preparing an archive' }); return; }
     const repo = db.repositories.find(r => r.id === Number(req.body?.repo_id) || r.forgejo_repo_id === Number(req.body?.repo_id));
     if (!repo || repo.mode !== 'live' || !repo.local_path) { res.status(400).json({ error: 'Select a registered live repository' }); return; }
@@ -770,6 +781,7 @@ async function startServer() {
   });
 
   app.post('/api/v1/academic/doi/:id/publish', async (req: Request, res: Response) => {
+    if (!PLANS[effectivePlan(db.users[0])].zenodo) { res.status(402).json({ error: 'Zenodo publication requires the Academic Researcher plan' }); return; }
     if (!zenodoClient) { res.status(503).json({ error: 'Zenodo is not configured' }); return; }
     if (req.body?.confirm_publication !== true) { res.status(400).json({ error: 'Explicit publication confirmation is required' }); return; }
     const record = db.academic_dois.find(d => d.id === Number(req.params.id) && d.environment === zenodoClient.origin);
@@ -825,6 +837,10 @@ async function startServer() {
     const releaseLock = await acquireRepoLock(repo.id);
 
     try {
+      const snapshotCount = db.panic_snapshots.filter(snapshot => snapshot.repository_id === repo.id).length;
+      if (snapshotLimitReached(effectivePlan(db.users[0]), snapshotCount)) {
+        res.status(402).json({ error: 'Free Developer includes one checkpoint per repository. Upgrade to create additional checkpoints.' }); return;
+      }
       if (repo.mode === 'live' && repo.local_path) {
         if (!gitWorkspace) { res.status(503).json({ error: 'Git workspace is not configured' }); return; }
         const sanitized = sanitizeSnapshotName(customSnapshotName);
@@ -1152,6 +1168,9 @@ async function startServer() {
 
   // Targeted Endpoints for Clean Partial Reads
   app.post('/api/v1/repositories', (req: Request, res: Response) => {
+    if (repositoryLimitReached(effectivePlan(db.users[0]), db.repositories.filter(r => r.mode === 'live').length)) {
+      res.status(402).json({ error: 'Free Developer includes three registered repositories. Upgrade to register more.' }); return;
+    }
     if (!gitWorkspace) { res.status(503).json({ error: 'Configure ADMIN_PASSWORD and GIT_REPOSITORIES_ROOT before registering live repositories' }); return; }
     const relative = req.body?.local_path;
     if (typeof relative !== 'string' || !relative.trim()) { res.status(400).json({ error: 'local_path is required' }); return; }
@@ -1212,7 +1231,8 @@ async function startServer() {
   });
 
   app.get('/api/v1/billing/subscription', (_req: Request, res: Response) => {
-    res.json(db.users[0] || null);
+    const user = db.users[0];
+    res.json(user ? { ...user, plan: effectivePlan(user) } : null);
   });
 
   app.get('/api/v1/sovereignty/stats', (_req: Request, res: Response) => {
@@ -1322,4 +1342,5 @@ async function startServer() {
 }
 
 startServer();
+
 

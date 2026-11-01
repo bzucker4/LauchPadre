@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test tests/state.test.ts tests/git.test.ts tests/stripe.test.ts tests/zenodo.test.ts tests/setup.test.mjs && node tests/smoke.mjs && node tests/smoke.mjs --live && node tests/smoke.mjs --live --local",
+    "test": "node --import tsx --test tests/state.test.ts tests/plans.test.ts tests/git.test.ts tests/stripe.test.ts tests/zenodo.test.ts tests/setup.test.mjs && node tests/smoke.mjs && node tests/smoke.mjs --live && node tests/smoke.mjs --live --local",
     "setup:local": "node scripts/setup-local.mjs",
     "local": "node scripts/start-local.mjs"
   },

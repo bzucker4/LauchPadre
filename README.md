@@ -89,9 +89,21 @@ For push ingestion, set `WEBHOOK_SECRET` and configure your Git forge to POST to
 
 Commit-message directives `todo: Task title` create tasks; `fix: Task title` and `close: Task title` mark matching tasks done. Commits are deduplicated per repository. Ingestion records commit metadata and task links; it does not fetch remote changes into the local checkout. Keep local repositories synchronized separately.
 
+## Plans and pricing
+
+| Plan | Monthly | Annual | Included limits |
+| --- | --- | --- | --- |
+| Free Developer | $0 | $0 | 3 registered local repositories, 1 checkpoint per repository, guarded rollback and Kanban |
+| Indie Solo | $5 | $39 | Unlimited registered local repositories and checkpoints; Kanban and signed Git webhook ingestion |
+| Academic Researcher | $9 | $69 | Indie features plus Zenodo draft creation and confirmed publication |
+
+All amounts are USD. Annual subscriptions are billed once per year. The UI and server use the same plan catalog. Free limits are checked on the server before adding repositories or snapshots; academic access is checked before preparing or publishing Zenodo archives. Existing data remains accessible after a downgrade, including rollback; new additions over the free limits are blocked. Registering a repository does not import every repository on your computer.
+
+These are workspace plan checks, not copy protection for distributed source code. A self-hosted owner controls the application and its database. Selling downloadable licenses would require a separate licensing model; no one-time or lifetime entitlement is implemented.
+
 ## Stripe
 
-Set `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `APP_ORIGIN`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_INDIE`, and `STRIPE_PRICE_ACADEMIC`. Prices must be existing recurring Stripe Price ids. Start with test credentials. Checkout uses the owner identity and server-controlled return URLs; it never accepts a client-supplied price or redirect origin.
+Set `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `APP_ORIGIN`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_INDIE`, and `STRIPE_PRICE_ACADEMIC`. Monthly Price ids must match $5/month for Indie and $9/month for Academic. Set `STRIPE_PRICE_INDIE_ANNUAL` to a $39/year recurring Price and `STRIPE_PRICE_ACADEMIC_ANNUAL` to a $69/year recurring Price to enable annual checkout. These must be USD per-unit licensed prices with one month or one year per billing interval. Checkout retrieves the configured Price and refuses a mismatched amount or interval before creating a session. Existing subscriptions and Stripe prices are not modified by editing this repository. Start with test credentials. Checkout uses the owner identity and server-controlled return URLs; it never accepts a client-supplied price or redirect origin.
 
 Configure Stripe's webhook endpoint as `/api/v1/billing/webhooks/stripe`, subscribing to `checkout.session.completed`, `customer.subscription.updated`, and `customer.subscription.deleted`. The endpoint verifies the raw-body signature and a five-minute timestamp tolerance, retrieves current subscription state, validates workspace metadata, and persists processed event ids. Redirecting back from checkout does not grant a plan. Signed webhook endpoints do not require a browser session.
 
@@ -125,7 +137,7 @@ npm run build
 npm test
 ```
 
-Tests exercise Git snapshots and recovery, refusal of unsafe worktrees, SQLite reopening, checkout request construction, Zenodo draft/publication separation and host restrictions, and authenticated API smoke tests in demo and live modes. Smoke tests cover registration, snapshots, tasks, signed webhook ingestion and replay handling, session controls, invalid signatures, and API errors.
+Tests exercise Git snapshots and recovery, refusal of unsafe worktrees, SQLite reopening, monthly/annual checkout construction and mismatched-price rejection, plan quotas, Zenodo draft/publication separation and host restrictions, and authenticated API smoke tests in demo and live modes. Smoke tests cover registration, snapshots, tasks, signed webhook ingestion and replay handling, session controls, invalid signatures, and API errors.
 
 ## Remaining operational work
 
@@ -138,3 +150,4 @@ Tests exercise Git snapshots and recovery, refusal of unsafe worktrees, SQLite r
 The `backend_python` directory is a legacy reference implementation. It is not started by the Node app and has not been validated for production. The dashboard source viewer displays that reference, not the active Node implementation. No repository license has been selected.
 
 API references: [Stripe Checkout creation](https://docs.stripe.com/api/checkout/sessions/create) and [Zenodo REST API](https://developers.zenodo.org/).
+
