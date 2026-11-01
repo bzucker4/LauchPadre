@@ -34,6 +34,27 @@ The default project folder is `repositories` inside the application folder. You 
 
 This setup has no cloud hosting bill. Your computer must be awake and the server running to use it. Its loopback address is not a public website: outside Stripe and Git webhook senders cannot reach it directly. Stripe/Zenodo are optional and can stay unconfigured for local Git and task use. Do not enable port forwarding or expose local-only HTTP mode to the internet.
 
+## Troubleshooting local checkout availability
+
+If the page reports a missing endpoint, stop the previous server with Ctrl+C before updating or starting another one. The launcher checks the port before building so that it cannot replace frontend files underneath an older running server. It never stops another process automatically.
+
+After updating and starting `npm run local`, use a **second terminal**:
+
+```sh
+cd ~/LauchPadre
+npm run doctor
+```
+
+The diagnostic checks health, API compatibility, local authentication, and the billing endpoint. It uses your local configuration to sign in temporarily, signs that session out, and does not print passwords, tokens, or customer data. Keep its output when requesting support. Missing Stripe configuration is reported as expected for local Git/task use rather than a network failure. The browser redirects expired sessions back to sign-in and provides a retry button for temporary availability failures.
+
+Run the disposable recovery checks in the same second terminal:
+
+```sh
+npm run test:recovery
+```
+
+They create their own temporary repositories and databases and remove them afterward. They do not use registered repositories or your workspace database. They verify checkpoint rollback, a stopped-workspace backup restore, and a process interrupted after saving its recovery ref but before reset. They do not simulate a power loss during Git's filesystem update. See `RELEASE_CHECKLIST.md` for remaining launch gates.
+
 ## Local setup
 
 Use Node.js 24, npm, and Git.

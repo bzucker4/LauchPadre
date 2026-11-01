@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { PLANS } from '../plans.ts';
+import { requestJson } from '../apiClient.ts';
 
 const FEATURES = {
   free: ['3 registered local repositories', '1 checkpoint per repository', 'Guarded rollback and Kanban tasks'],
@@ -14,26 +15,32 @@ export const StripeTab = React.memo(function StripeTab({ currentUser, onUserPlan
   const [checkoutData, setCheckoutData] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  useEffect(() => {
-    let active = true;
-    fetch('/api/v1/billing/plans').then(async response => {
-      if (!response.ok) throw new Error();
-      const result = await response.json();
-      if (active) setAvailability(Object.fromEntries(result.plans.map(plan => [plan.id, plan])));
-    }).catch(() => { if (active) setError('Unable to load checkout availability. Reload to try again.'); })
-      .finally(() => { if (active) setLoaded(true); });
-    return () => { active = false; };
+  const loadAvailability = useCallback(async signal => {
+    setLoaded(false); setError('');
+    try {
+      const result = await requestJson('/api/v1/billing/plans', { signal });
+      if (!Array.isArray(result?.plans)) throw new Error('The running server returned an unsupported billing response. Restart LaunchPadre and reload.');
+      if (!signal?.aborted) setAvailability(Object.fromEntries(result.plans.map(plan => [plan.id, plan])));
+    } catch (failure) {
+      if (!signal?.aborted) {
+        setAvailability({});
+        setError(failure instanceof Error ? failure.message : 'Unable to check payment availability. Run npm run doctor.');
+      }
+    } finally { if (!signal?.aborted) setLoaded(true); }
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    loadAvailability(controller.signal);
+    return () => controller.abort();
+  }, [loadAvailability]);
   const checkout = async plan => {
     if (!currentUser) return;
     setBusy(true); setError(''); setCheckoutData(null);
     try {
-      const response = await fetch('/api/v1/billing/checkout-session', {
+      const result = await requestJson('/api/v1/billing/checkout-session', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: currentUser.id, plan_id: plan, billing_interval: interval }),
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Checkout failed');
       setCheckoutData(result);
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Unable to connect'); }
     finally { setBusy(false); }
@@ -47,7 +54,7 @@ export const StripeTab = React.memo(function StripeTab({ currentUser, onUserPlan
       </button>)}
     </div>
     <p className="text-sm text-slate-400">USD. Annual plans are billed once per year. Checkpoints protect committed work; commit your changes before creating one. Zenodo requires your own account and token.</p>
-    {error && <p role="alert" className="text-red-300">{error}</p>}
+    {error && <div role="alert" className="space-y-2 text-red-300"><p>{error}</p><button type="button" disabled={!loaded || busy} onClick={() => loadAvailability()} className="rounded border border-slate-600 px-4 py-2 text-sm text-slate-200">Retry availability</button></div>}
     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
       {Object.entries(PLANS).map(([id, plan]) => {
         const cents = interval === 'month' ? plan.monthly : plan.annual;
@@ -63,7 +70,7 @@ export const StripeTab = React.memo(function StripeTab({ currentUser, onUserPlan
               className="w-full rounded bg-amber-400 text-slate-950 px-4 py-2 font-semibold disabled:opacity-50">
               {currentUser?.stripe_subscription_id ? (active ? 'Current subscription' : 'Manage existing subscription first') : busy ? 'Preparing checkout…' : `Subscribe to ${plan.name}`}
             </button>
-            {loaded && !configured && <p className="text-sm text-slate-400">{interval === 'year' ? 'Annual' : 'Monthly'} checkout is not available in this workspace yet.</p>}
+            {loaded && !error && !configured && <p className="text-sm text-slate-400">{interval === 'year' ? 'Annual' : 'Monthly'} payments are not configured. Local Git and tasks still work.</p>}
           </>}
         </article>;
       })}

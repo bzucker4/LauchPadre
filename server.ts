@@ -1,3 +1,4 @@
+import { WORKSPACE_API_VERSION } from './src/apiVersion.ts';
 import { PLANS, effectivePlan, repositoryLimitReached, snapshotLimitReached } from './src/plans.ts';
 import { ZenodoClient } from './src/zenodoClient.ts';
 import { StripeClient } from './src/stripeClient.ts';
@@ -633,6 +634,11 @@ async function startServer() {
   app.use('/api/v1/webhooks/git-core', express.raw({ type: '*/*', limit: '5mb' }));
   app.use('/api/v1/billing/webhooks/stripe', express.raw({ type: '*/*', limit: '2mb' }));
   app.use(express.json({ limit: '5mb' }));
+
+  app.get('/api/version', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ api_version: WORKSPACE_API_VERSION });
+  });
 
   installAuthentication(app);
 
@@ -1336,8 +1342,12 @@ async function startServer() {
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  app.listen(PORT, localOnly ? '127.0.0.1' : '0.0.0.0', () => {
+  const listener = app.listen(PORT, localOnly ? '127.0.0.1' : '0.0.0.0', () => {
     console.log(localOnly ? `LaunchPadre is ready at http://127.0.0.1:${PORT}` : `LaunchPadre listening on port ${PORT}`);
+  });
+  listener.on('error', (error: NodeJS.ErrnoException) => {
+    console.error(error.code === 'EADDRINUSE' ? `Port ${PORT} is already in use. Stop the previous server with Ctrl+C before restarting.` : error.message);
+    process.exitCode = 1;
   });
 }
 

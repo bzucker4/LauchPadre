@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import assert from 'node:assert/strict';
@@ -20,8 +20,9 @@ await mkdir(project);
 const git = (...args) => execFileSync('git', ['-C', project, ...args], { encoding: 'utf8' }).trim();
 git('init', '-q'); git('config', 'user.name', 'Smoke'); git('config', 'user.email', 'smoke@example.com');
 await writeFile(path.join(project, 'file.txt'), 'baseline'); git('add', '.'); git('commit', '-qm', 'baseline');
+const serverEnv = { ...process.env, NODE_ENV: 'production', LOCAL_ONLY: localOnly ? 'true' : 'false', LAUNCHPADRE_DEMO: liveMode ? 'false' : 'true', ADMIN_EMAIL: 'owner@example.com', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db'), GIT_REPOSITORIES_ROOT: directory, STRIPE_WEBHOOK_SECRET: 'test-webhook-secret', WEBHOOK_SECRET: 'test-git-secret', STRIPE_SECRET_KEY: '', ZENODO_ACCESS_TOKEN: '' };
 const child = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
-  env: { ...process.env, NODE_ENV: 'production', LOCAL_ONLY: localOnly ? 'true' : 'false', LAUNCHPADRE_DEMO: liveMode ? 'false' : 'true', ADMIN_EMAIL: 'owner@example.com', PORT: String(port), ADMIN_PASSWORD: 'smoke-test-password-12345', STATE_DB_PATH: path.join(directory, 'state.db'), GIT_REPOSITORIES_ROOT: directory, STRIPE_WEBHOOK_SECRET: 'test-webhook-secret', WEBHOOK_SECRET: 'test-git-secret' },
+  env: serverEnv,
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
@@ -38,6 +39,12 @@ try {
   }
   assert.ok(ready, `Server did not become ready: ${logs}`);
   assert.deepEqual(await (await fetch(`${base}/healthz`)).json(), { status: 'ok', mode: liveMode ? 'live' : 'demo' });
+  const version = await (await fetch(`${base}/api/version`)).json();
+  assert.equal(version.api_version, 2);
+  const diagnostics = spawnSync(process.execPath, ['scripts/doctor.mjs'], { env: serverEnv, encoding: 'utf8', timeout: 15_000 });
+  assert.equal(diagnostics.status, 0, diagnostics.stderr);
+  assert.ok(diagnostics.stdout.includes('Payments are not configured'));
+  assert.ok(!diagnostics.stdout.includes(serverEnv.ADMIN_PASSWORD));
   assert.equal((await fetch(`${base}/api/v1/repositories`)).status, 401);
   const rejected = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'wrong' }) });
   assert.equal(rejected.status, 401);

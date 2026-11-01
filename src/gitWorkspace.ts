@@ -23,7 +23,7 @@ export class GitWorkspace {
     return directory;
   }
 
-  private run(directory: string, args: string[]) {
+  protected run(directory: string, args: string[]) {
     const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
     return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', directory, ...args], {
       encoding: 'utf8', timeout: 20_000, maxBuffer: 2 * 1024 * 1024,

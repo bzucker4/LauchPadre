@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { requestJson } from './apiClient.ts';
 import LaunchPadreDashboard from './LaunchPadreDashboard.jsx';
 
 export default function App() {
@@ -9,19 +10,34 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [required, setRequired] = useState(false);
   useEffect(() => {
-    fetch('/api/auth/session').then(r => {
-      if (!r.ok) throw new Error('Unable to check session');
-      return r.json();
-    }).then(s => { setAuthenticated(s.authenticated); setRequired(s.required); })
-      .catch(() => setError('Unable to connect. Reload to try again.'))
+    requestJson('/api/auth/session').then(s => { setAuthenticated(s.authenticated); setRequired(s.required); })
+      .catch(error => setError(error instanceof Error ? error.message : 'Unable to connect. Run npm run doctor.'))
       .finally(() => setLoading(false));
   }, []);
+  useEffect(() => {
+    const expired = () => {
+      setAuthenticated(false); setPassword('');
+      setError('Your session expired or the server restarted. Sign in again.');
+    };
+    window.addEventListener('launchpadre:session-expired', expired);
+    return () => window.removeEventListener('launchpadre:session-expired', expired);
+  }, []);
+  useEffect(() => {
+    if (!authenticated) return;
+    let active = true;
+    const check = async () => {
+      try { const session = await requestJson('/api/auth/session'); if (active && !session.authenticated) window.dispatchEvent(new Event('launchpadre:session-expired')); }
+      catch { /* Keep the workspace visible during a temporary network failure. */ }
+    };
+    const timer = window.setInterval(check, 30_000);
+    window.addEventListener('focus', check);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener('focus', check); };
+  }, [authenticated]);
   if (loading) return <p className="p-8">Loading workspace…</p>;
   if (authenticated) return <>
     {required && <button className="fixed bottom-4 right-4 z-50 bg-slate-800 px-4 py-2 rounded" onClick={async () => {
       try {
-        const response = await fetch('/api/auth/logout', { method: 'POST' });
-        if (!response.ok) throw new Error();
+        await requestJson('/api/auth/logout', { method: 'POST' });
         setAuthenticated(false);
       } catch { setError('Sign out failed. Try again.'); }
     }}>Sign out</button>}
@@ -32,9 +48,7 @@ export default function App() {
     <form className="w-full max-w-sm space-y-5" onSubmit={async e => {
       e.preventDefault(); setBusy(true); setError('');
       try {
-        const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || 'Sign in failed');
+        await requestJson('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
         setPassword(''); setAuthenticated(true); setRequired(true);
       } catch (err) { setError(err instanceof Error ? err.message : 'Sign in failed'); }
       finally { setBusy(false); }
