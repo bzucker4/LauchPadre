@@ -1,177 +1,59 @@
 import React, { useState } from 'react';
-import { Award, ExternalLink } from 'lucide-react';
 
-export const ZenodoTab = React.memo(function ZenodoTab({
-  currentRepo,
-  dois,
-  onDoiMinted,
-}) {
-  const [doiTitle, setDoiTitle] = useState('LaunchPadre Core Engine — Reproducible Git Infrastructure');
-  const [creatorName, setCreatorName] = useState('Elena Rostova');
-  const [affiliation, setAffiliation] = useState('LaunchPadre Systems Research');
-  const [doiDescription, setDoiDescription] = useState('Frozen research software code archive published via LaunchPadre.');
-  const [isMintingDoi, setIsMintingDoi] = useState(false);
-  const [mintedDoiResult, setMintedDoiResult] = useState(null);
-
-  const handleMintDoi = async (e) => {
-    e.preventDefault();
-    if (!currentRepo) return;
-    setIsMintingDoi(true);
+export const ZenodoTab = React.memo(function ZenodoTab({ currentRepo, dois, onDoiMinted }) {
+  const [title, setTitle] = useState('');
+  const [creator, setCreator] = useState('');
+  const [description, setDescription] = useState('');
+  const [license, setLicense] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const prepare = async event => {
+    event.preventDefault(); setBusy(true); setError('');
     try {
-      const res = await fetch('/api/v1/academic/doi/mint', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          repo_id: currentRepo.forgejo_repo_id,
-          title: doiTitle.trim(),
-          description: doiDescription.trim(),
-          creator_name: creatorName.trim(),
-          creator_affiliation: affiliation.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setMintedDoiResult(data);
-        onDoiMinted();
-      }
-    } finally {
-      setIsMintingDoi(false);
-    }
+      const response = await fetch('/api/v1/academic/doi/mint', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo_id: currentRepo?.forgejo_repo_id, title, creator_name: creator, description, license }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Unable to prepare archive');
+      onDoiMinted();
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Unable to connect'); }
+    finally { setBusy(false); onDoiMinted(); }
   };
-
-  return (
-    <section className="space-y-6">
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        <div className="lg:col-span-6 bg-[#0b132b] border border-slate-800/90 rounded-lg p-6 space-y-5">
-          <div>
-            <h2 className="text-lg font-semibold text-slate-100 font-display flex items-center gap-2">
-              <Award className="w-4 h-4 text-amber-400" />
-              <span>Mint Zenodo Academic DOI</span>
-            </h2>
-            <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-              Bundles repository worktree into clean <code className="text-slate-200 font-mono">.zip</code> (ignoring <code className="text-slate-200 font-mono">.git</code>), streams it to Zenodo, injects CSL metadata, and locks the deposition.
-            </p>
-          </div>
-
-          <form onSubmit={handleMintDoi} className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 block">Software Title</label>
-              <input
-                type="text"
-                value={doiTitle}
-                onChange={(e) => setDoiTitle(e.target.value)}
-                required
-                className="w-full px-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-md text-slate-100 focus:outline-none focus:border-amber-400"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-300 block">Creator Name</label>
-                <input
-                  type="text"
-                  value={creatorName}
-                  onChange={(e) => setCreatorName(e.target.value)}
-                  required
-                  className="w-full px-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-md text-slate-100 focus:outline-none focus:border-amber-400"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-300 block">Affiliation</label>
-                <input
-                  type="text"
-                  value={affiliation}
-                  onChange={(e) => setAffiliation(e.target.value)}
-                  required
-                  className="w-full px-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-md text-slate-100 focus:outline-none focus:border-amber-400"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 block">Abstract</label>
-              <textarea
-                rows={3}
-                value={doiDescription}
-                onChange={(e) => setDoiDescription(e.target.value)}
-                className="w-full px-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-md text-slate-100 focus:outline-none focus:border-amber-400"
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={isMintingDoi}
-              className="w-full py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-md transition-colors disabled:opacity-50 cursor-pointer flex items-center justify-center gap-1.5"
-            >
-              <Award className="w-3.5 h-3.5" />
-              <span>{isMintingDoi ? 'Packaging & Minting DOI...' : 'POST /api/v1/academic/doi/mint'}</span>
-            </button>
-          </form>
-
-          {mintedDoiResult && (
-            <div className="p-4 bg-emerald-950/20 border border-emerald-800/70 rounded-md space-y-2 font-mono text-xs">
-              <div className="text-emerald-300 font-semibold">✓ Permanent DOI Registered</div>
-              <div className="text-slate-100 text-sm font-bold">{mintedDoiResult.doi}</div>
-              <a
-                href={mintedDoiResult.doi_url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-amber-300 hover:underline flex items-center gap-1"
-              >
-                <span>{mintedDoiResult.doi_url}</span>
-                <ExternalLink className="w-3 h-3" />
-              </a>
-            </div>
-          )}
-        </div>
-
-        {/* Minted DOI Table */}
-        <div className="lg:col-span-6 bg-[#0b132b] border border-slate-800/90 rounded-lg p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-base font-semibold text-slate-100 font-display">
-              academic_doi_registries Table
-            </h3>
-            <span className="text-xs font-mono text-slate-400 tabular-nums">
-              {dois.length} registered
-            </span>
-          </div>
-
-          <div className="space-y-3">
-            {dois.length === 0 ? (
-              <div className="py-12 px-4 text-center border border-dashed border-slate-800 rounded-lg text-xs text-slate-400">
-                No academic DOIs minted for this repository yet.
-              </div>
-            ) : (
-              dois.map((entry) => (
-                <div key={entry.id} className="p-4 bg-slate-900 border border-slate-800 rounded-lg space-y-3">
-                  <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <span className="text-sm font-bold font-mono text-amber-300">{entry.doi}</span>
-                      <h4 className="text-xs font-semibold text-slate-100 mt-0.5">{entry.title}</h4>
-                      <p className="text-[11px] text-slate-400">
-                        {entry.creator_name} ({entry.creator_affiliation})
-                      </p>
-                    </div>
-                    <a
-                      href={entry.doi_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="px-2.5 py-1 text-xs font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 rounded flex items-center gap-1 shrink-0"
-                    >
-                      <span>DOI Link</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <div className="pt-2 border-t border-slate-800 text-[11px] font-mono text-slate-500 flex items-center justify-between tabular-nums">
-                    <span>commit: {entry.commit_sha?.slice(0, 10)}…</span>
-                    <span>minted: {entry.minted_at?.slice(0, 19).replace('T', ' ')}</span>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      </div>
-    </section>
-  );
+  const publish = async record => {
+    if (!window.confirm(`Publish deposition ${record.deposition_id} on ${record.environment}? Confirm that you reviewed the committed archive, metadata, and license. Published deposits cannot be deleted through this workflow.`)) return;
+    setBusy(true); setError('');
+    try {
+      const response = await fetch(`/api/v1/academic/doi/${record.id}/publish`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm_publication: true }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Publication failed');
+      onDoiMinted();
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Unable to connect'); }
+    finally { setBusy(false); onDoiMinted(); }
+  };
+  const inputClass = 'block w-full mt-1 rounded border border-slate-600 bg-slate-900 p-3';
+  return <section className="space-y-6">
+    <div className="rounded border border-slate-700 p-5 space-y-4">
+      <h2 className="text-xl font-bold">Prepare a Zenodo software archive</h2>
+      <p className="text-sm text-slate-400">Archives committed files from the selected live repository. Review those files for private information before uploading. Preparing creates an unpublished draft. Publication requires a separate confirmation. Sandbox is the default environment.</p>
+      {error && <p role="alert" className="text-red-300">{error}</p>}
+      <form onSubmit={prepare} className="space-y-4 max-w-xl">
+        <label className="block">Software title<input required value={title} onChange={e => setTitle(e.target.value)} className={inputClass} /></label>
+        <label className="block">Creator name<input required value={creator} onChange={e => setCreator(e.target.value)} className={inputClass} /></label>
+        <label className="block">Description<textarea required value={description} onChange={e => setDescription(e.target.value)} className={inputClass} /></label>
+        <label className="block">Zenodo license identifier<input required placeholder="Choose the license for this repository" value={license} onChange={e => setLicense(e.target.value)} className={inputClass} /></label>
+        <button disabled={busy || currentRepo?.mode !== 'live'} className="rounded bg-amber-400 text-slate-950 px-4 py-3 font-semibold disabled:opacity-50">{busy ? 'Working…' : 'Prepare unpublished draft'}</button>
+        {currentRepo?.mode !== 'live' && <p className="text-amber-300">Select a registered live repository to prepare an archive.</p>}
+      </form>
+    </div>
+    <div className="space-y-4">
+      {dois.map(record => <article key={record.id} className="rounded border border-slate-700 p-4 space-y-2">
+        <h3 className="font-bold">{record.title}</h3>
+        <p className="text-sm">{record.status || 'Sample DOI record'} · {record.environment || 'Demo'}</p>
+        {record.environment && <a className="text-amber-300 underline" target="_blank" rel="noreferrer" href={`${record.environment}/deposit/${record.deposition_id}`}>Review deposition {record.deposition_id} on Zenodo</a>}
+        {record.status === 'published' && <a className="block text-amber-300 underline" href={record.doi_url}>{record.doi}</a>}
+        {['draft', 'publishing'].includes(record.status) && <button disabled={busy} onClick={() => publish(record)} className="block rounded border border-amber-500 px-4 py-2 disabled:opacity-50">{record.status === 'publishing' ? 'Check publication status' : 'Confirm publication…'}</button>}
+        {record.status === 'upload_failed' && <p className="text-red-300">Upload incomplete. Prepare this same commit again to retry the saved draft.</p>}
+      </article>)}
+      {!dois.length && <p className="text-slate-400">No archives for this repository.</p>}
+    </div>
+  </section>;
 });

@@ -1,164 +1,84 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { PLANS } from '../plans.ts';
+import { requestJson } from '../apiClient.ts';
 
-export const StripeTab = React.memo(function StripeTab({
-  currentUser,
-  onUserPlanUpdated,
-}) {
+const FEATURES = {
+  free: ['3 registered local repositories', '1 checkpoint per repository', 'Guarded rollback and Kanban tasks'],
+  indie_solo: ['Unlimited registered local repositories', 'Unlimited committed-HEAD checkpoints', 'Guarded rollback with recovery refs', 'Kanban tasks and Git webhook ingestion'],
+  academic_tier: ['Everything in Indie Solo', 'Zenodo software archive drafts', 'Separate, confirmed publication', 'DOI links after successful publication'],
+};
+
+export const StripeTab = React.memo(function StripeTab({ currentUser, onUserPlanUpdated }) {
+  const [interval, setInterval] = useState('month');
+  const [availability, setAvailability] = useState({});
+  const [loaded, setLoaded] = useState(false);
   const [checkoutData, setCheckoutData] = useState(null);
-  const [isCreatingCheckout, setIsCreatingCheckout] = useState(false);
-  const [webhookOutcome, setWebhookOutcome] = useState(null);
-
-  const handleCheckout = async (planId) => {
-    if (!currentUser) return;
-    setIsCreatingCheckout(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const loadAvailability = useCallback(async signal => {
+    setLoaded(false); setError('');
     try {
-      const res = await fetch('/api/v1/billing/checkout-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_id: currentUser.id,
-          plan_id: planId,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) setCheckoutData(data);
-    } finally {
-      setIsCreatingCheckout(false);
-    }
-  };
-
-  const handleSimulateWebhook = async (eventType) => {
+      const result = await requestJson('/api/v1/billing/plans', { signal });
+      if (!Array.isArray(result?.plans)) throw new Error('The running server returned an unsupported billing response. Restart LaunchPadre and reload.');
+      if (!signal?.aborted) setAvailability(Object.fromEntries(result.plans.map(plan => [plan.id, plan])));
+    } catch (failure) {
+      if (!signal?.aborted) {
+        setAvailability({});
+        setError(failure instanceof Error ? failure.message : 'Unable to check payment availability. Run npm run doctor.');
+      }
+    } finally { if (!signal?.aborted) setLoaded(true); }
+  }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    loadAvailability(controller.signal);
+    return () => controller.abort();
+  }, [loadAvailability]);
+  const checkout = async plan => {
     if (!currentUser) return;
-    const res = await fetch('/api/v1/billing/webhooks/stripe', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Stripe-Signature': 't=1600000000,v1=simulated_hex',
-      },
-      body: JSON.stringify({
-        type: eventType,
-        data: {
-          object: {
-            client_reference_id: String(currentUser.id),
-            customer: currentUser.stripe_customer_id || `cus_${currentUser.username}`,
-            subscription: `sub_stripe_${Date.now().toString().slice(-6)}`,
-            metadata: { plan_id: 'academic_tier' },
-          },
-        },
-      }),
-    });
-    const data = await res.json();
-    setWebhookOutcome(data);
-    onUserPlanUpdated();
+    setBusy(true); setError(''); setCheckoutData(null);
+    try {
+      const result = await requestJson('/api/v1/billing/checkout-session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: currentUser.id, plan_id: plan, billing_interval: interval }),
+      });
+      setCheckoutData(result);
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Unable to connect'); }
+    finally { setBusy(false); }
   };
-
-  return (
-    <section className="space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div
-          className={`p-5 bg-[#0b132b] border rounded-lg space-y-3 ${
-            currentUser?.plan === 'free' ? 'border-amber-400' : 'border-slate-800'
-          }`}
-        >
-          <div className="text-xs font-mono text-slate-400">Tier 01</div>
-          <h3 className="text-base font-bold text-slate-100 font-display">Free Developer</h3>
-          <div className="text-xl font-bold font-mono">
-            $0 <span className="text-xs font-normal text-slate-400">/mo</span>
-          </div>
-          <ul className="text-xs text-slate-300 space-y-1.5">
-            <li>✓ 3 Repositories</li>
-            <li>✓ 1 Panic Snapshot</li>
-          </ul>
-        </div>
-
-        <div
-          className={`p-5 bg-[#0b132b] border rounded-lg space-y-3 ${
-            currentUser?.plan === 'indie_solo' ? 'border-amber-400 ring-1 ring-amber-400' : 'border-slate-800'
-          }`}
-        >
-          <div className="text-xs font-mono text-amber-300">Tier 02 · Recommended</div>
-          <h3 className="text-base font-bold text-slate-100 font-display">Indie Solo</h3>
-          <div className="text-xl font-bold font-mono">
-            $12 <span className="text-xs font-normal text-slate-400">/mo</span>
-          </div>
-          <ul className="text-xs text-slate-300 space-y-1.5">
-            <li>✓ Unlimited Repositories</li>
-            <li>✓ Panic Room Hard Reset Engine</li>
-            <li>✓ Filesystem Slop Sweep (git clean -fd)</li>
-          </ul>
-          <button
-            type="button"
-            onClick={() => handleCheckout('indie_solo')}
-            disabled={isCreatingCheckout}
-            className="w-full py-2 text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 rounded cursor-pointer"
-          >
-            Subscribe to Indie Solo
-          </button>
-        </div>
-
-        <div
-          className={`p-5 bg-[#0b132b] border rounded-lg space-y-3 ${
-            currentUser?.plan === 'academic_tier' ? 'border-amber-400 ring-1 ring-amber-400' : 'border-slate-800'
-          }`}
-        >
-          <div className="text-xs font-mono text-amber-300">Tier 03 · Institutions</div>
-          <h3 className="text-base font-bold text-slate-100 font-display">Academic Researcher</h3>
-          <div className="text-xl font-bold font-mono">
-            $29 <span className="text-xs font-normal text-slate-400">/mo</span>
-          </div>
-          <ul className="text-xs text-slate-300 space-y-1.5">
-            <li>✓ All Indie Solo features</li>
-            <li>✓ Automated Zenodo DOI Minting</li>
-            <li>✓ Permanent Citation Badges</li>
-          </ul>
-          <button
-            type="button"
-            onClick={() => handleCheckout('academic_tier')}
-            disabled={isCreatingCheckout}
-            className="w-full py-2 text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 rounded cursor-pointer"
-          >
-            Subscribe to Academic
-          </button>
-        </div>
-      </div>
-
-      {checkoutData && (
-        <div className="p-4 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono space-y-1">
-          <div className="text-amber-300 font-semibold">Created Checkout Session: {checkoutData.session_id}</div>
-          <div className="text-slate-400">URL: {checkoutData.checkout_url}</div>
-        </div>
-      )}
-
-      {/* Simulated Webhook Controls */}
-      <div className="p-5 bg-[#0b132b] border border-slate-800 rounded-lg space-y-3">
-        <h3 className="text-sm font-semibold text-slate-100 font-display">
-          Stripe Webhook Lifecycle Simulator
-        </h3>
-        <p className="text-xs text-slate-400">
-          Trigger simulated Stripe webhook payloads to test asynchronous user upgrades and downgrades via <code className="font-mono text-slate-200">POST /api/v1/billing/webhooks/stripe</code>.
-        </p>
-        <div className="flex flex-wrap gap-3">
-          <button
-            type="button"
-            onClick={() => handleSimulateWebhook('checkout.session.completed')}
-            className="px-3 py-1.5 text-xs font-medium bg-emerald-950/60 border border-emerald-700 text-emerald-200 hover:bg-emerald-900/80 rounded transition-colors cursor-pointer"
-          >
-            Simulate checkout.session.completed
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSimulateWebhook('customer.subscription.deleted')}
-            className="px-3 py-1.5 text-xs font-medium bg-rose-950/60 border border-rose-700 text-rose-200 hover:bg-rose-900/80 rounded transition-colors cursor-pointer"
-          >
-            Simulate customer.subscription.deleted
-          </button>
-        </div>
-        {webhookOutcome && (
-          <div className="p-3 bg-slate-950 border border-slate-800 rounded text-xs font-mono text-slate-300">
-            Webhook Processed: {JSON.stringify(webhookOutcome)}
-          </div>
-        )}
-      </div>
-    </section>
-  );
+  return <section className="space-y-6">
+    <div className="flex flex-wrap items-center gap-3">
+      <h2 className="text-xl font-bold mr-3">Plans and pricing</h2>
+      {['month', 'year'].map(value => <button key={value} type="button" aria-pressed={interval === value} disabled={busy} onClick={() => { setInterval(value); setCheckoutData(null); }}
+        className={`rounded border px-4 py-2 ${interval === value ? 'border-amber-400 text-amber-300' : 'border-slate-700 text-slate-300'}`}>
+        {value === 'month' ? 'Monthly' : 'Annual'}
+      </button>)}
+    </div>
+    <p className="text-sm text-slate-400">USD. Annual plans are billed once per year. Checkpoints protect committed work; commit your changes before creating one. Zenodo requires your own account and token.</p>
+    {error && <div role="alert" className="space-y-2 text-red-300"><p>{error}</p><button type="button" disabled={!loaded || busy} onClick={() => loadAvailability()} className="rounded border border-slate-600 px-4 py-2 text-sm text-slate-200">Retry availability</button></div>}
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      {Object.entries(PLANS).map(([id, plan]) => {
+        const cents = interval === 'month' ? plan.monthly : plan.annual;
+        const active = currentUser?.plan === id;
+        const configured = availability[id]?.[interval === 'month' ? 'monthly_checkout' : 'annual_checkout'];
+        return <article key={id} className={`p-5 bg-[#0b132b] border rounded-lg space-y-4 ${active ? 'border-amber-400' : 'border-slate-800'}`}>
+          <h3 className="text-lg font-bold">{plan.name}</h3>
+          <div className="text-2xl font-bold font-mono">${cents / 100}<span className="text-sm font-normal text-slate-400">/{interval === 'month' ? 'month' : 'year'}</span></div>
+          {id !== 'free' && interval === 'year' && <p className="text-sm text-amber-300">Save ${(plan.monthly * 12 - plan.annual) / 100} compared with 12 monthly payments.</p>}
+          <ul className="space-y-2 text-sm text-slate-300">{FEATURES[id].map(feature => <li key={feature}>✓ {feature}</li>)}</ul>
+          {id === 'free' ? <p className="text-sm text-amber-300">{active ? 'Current plan' : 'Free plan available after paid subscription ends'}</p> : <>
+            <button type="button" onClick={() => checkout(id)} disabled={busy || !currentUser || !configured || Boolean(currentUser.stripe_subscription_id)}
+              className="w-full rounded bg-amber-400 text-slate-950 px-4 py-2 font-semibold disabled:opacity-50">
+              {currentUser?.stripe_subscription_id ? (active ? 'Current subscription' : 'Manage existing subscription first') : busy ? 'Preparing checkout…' : `Subscribe to ${plan.name}`}
+            </button>
+            {loaded && !error && !configured && <p className="text-sm text-slate-400">{interval === 'year' ? 'Annual' : 'Monthly'} payments are not configured. Local Git and tasks still work.</p>}
+          </>}
+        </article>;
+      })}
+    </div>
+    <p className="text-sm text-slate-400">Your plan changes after a verified payment webhook. Existing subscriptions are managed in Stripe.</p>
+    <button type="button" onClick={onUserPlanUpdated} className="rounded border border-slate-600 px-4 py-2 text-sm">Refresh subscription status</button>
+    {checkoutData && <div className="p-4 rounded border border-slate-700">
+      <a href={checkoutData.checkout_url} className="text-amber-300 underline">Continue to Stripe Checkout</a>
+    </div>}
+  </section>;
 });
