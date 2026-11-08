@@ -2,6 +2,8 @@ import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { DatabaseSync } from 'node:sqlite';
+import { CustomerAuth } from './src/customerAuth.ts';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 
@@ -478,7 +480,17 @@ function createInitialStore(): RelationalStore {
   };
 }
 
-let db: RelationalStore = createInitialStore();
+const workspacePath = process.env.LAUNCHPADRE_WORKSPACE_DB || path.join(__dirname, 'data', 'workspace-runtime.db');
+fs.mkdirSync(path.dirname(workspacePath), { recursive: true });
+const workspaceDatabase = new DatabaseSync(workspacePath);
+workspaceDatabase.exec(`CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, body TEXT NOT NULL)`);
+const savedWorkspace = workspaceDatabase.prepare('SELECT version, body FROM workspace WHERE id=1').get() as { version: number; body: string } | undefined;
+if (savedWorkspace && savedWorkspace.version !== 1) throw new Error(`Unsupported workspace version ${savedWorkspace.version}`);
+let db: RelationalStore = savedWorkspace ? JSON.parse(savedWorkspace.body) as RelationalStore : createInitialStore();
+function persistWorkspace() {
+  workspaceDatabase.prepare('INSERT INTO workspace (id, version, body) VALUES (1, 1, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(JSON.stringify(db));
+}
+if (!savedWorkspace) persistWorkspace();
 
 recordLog(
   'INFO',
@@ -541,6 +553,151 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 
 async function startServer() {
   const app = express();
+  const customerAuth = new CustomerAuth(workspaceDatabase);
+  app.disable('x-powered-by');
+  const production = process.env.NODE_ENV === 'production';
+  const accessToken = process.env.LAUNCHPADRE_ACCESS_TOKEN;
+  const sessionSecret = process.env.WEBHOOK_SECRET || '';
+  const sessionSignature = () => crypto.createHmac('sha256', sessionSecret).update('launchpadre-admin-session-v1').digest('hex');
+  if (production && (!accessToken || accessToken.length < 32 || !process.env.WEBHOOK_SECRET || process.env.WEBHOOK_SECRET.length < 32)) {
+    throw new Error('Production requires LAUNCHPADRE_ACCESS_TOKEN and WEBHOOK_SECRET (32+ characters each)');
+  }
+  app.get('/healthz', (_req: Request, res: Response) => res.json({ status: 'ok' }));
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    next();
+  });
+  const customerCookie = (req: Request) => req.header('cookie')?.match(/(?:^|;\s*)lp_customer=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+  const customerCookieOptions = `HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production ? '; Secure' : ''}`;
+  const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
+  const authThrottle = (req: Request, res: Response, next: NextFunction) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const prior = registrationAttempts.get(key);
+    const entry = prior && prior.resetAt > now ? prior : { count: 0, resetAt: now + 15 * 60_000 };
+    entry.count += 1;
+    registrationAttempts.set(key, entry);
+    if (entry.count > 20) { res.status(429).json({ error: 'Too many attempts' }); return; }
+    next();
+  };
+  app.post('/api/customer/register', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    try {
+      const email = req.body?.email;
+      const password = req.body?.password;
+      if (typeof email !== 'string' || typeof password !== 'string') { res.status(400).json({ error: 'Invalid credentials' }); return; }
+      const account = customerAuth.register(email, password);
+      res.status(201).json(account);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('UNIQUE constraint')) { res.status(409).json({ error: 'Account already exists' }); return; }
+      res.status(400).json({ error: 'Registration failed or credentials invalid' });
+    }
+  });
+  app.post('/api/customer/login', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    const password = req.body?.password;
+    if (typeof email !== 'string' || typeof password !== 'string' || password.length > 1024) { res.status(400).json({ error: 'Invalid credentials' }); return; }
+    const login = customerAuth.login(email, password);
+    if (!login) { res.status(401).json({ error: 'Invalid credentials' }); return; }
+    res.setHeader('Set-Cookie', `lp_customer=${login.token}; ${customerCookieOptions}`);
+    res.json({ status: 'authenticated' });
+  });
+  app.get('/api/customer/me', (req: Request, res: Response) => {
+    const customer = customerAuth.session(customerCookie(req));
+    if (!customer) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    res.json(customer);
+  });
+  // Customer-scoped data is intentionally separate from legacy demonstration state.
+  workspaceDatabase.exec(`CREATE TABLE IF NOT EXISTS customer_repositories (
+    id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_customer_repositories_owner ON customer_repositories(customer_id);
+  CREATE TABLE IF NOT EXISTS customer_tasks (
+    id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES customer_repositories(id) ON DELETE CASCADE,
+    title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','done')),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_customer_tasks_repo ON customer_tasks(repository_id);`);
+  const requireCustomer = (req: Request, res: Response, next: NextFunction) => {
+    const customer = customerAuth.session(customerCookie(req));
+    if (!customer) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    res.locals.customer = customer;
+    next();
+  };
+  app.get('/api/customer/repositories', requireCustomer, (_req: Request, res: Response) => {
+    res.json(workspaceDatabase.prepare('SELECT id,name,created_at FROM customer_repositories WHERE customer_id=? ORDER BY created_at DESC').all(res.locals.customer.id));
+  });
+  app.post('/api/customer/repositories', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const name = req.body?.name;
+    if (typeof name !== 'string' || !name.trim() || name.length > 120) { res.status(400).json({ error: 'Invalid repository name' }); return; }
+    const id = crypto.randomUUID();
+    workspaceDatabase.prepare('INSERT INTO customer_repositories (id,customer_id,name,created_at) VALUES (?,?,?,?)').run(id,res.locals.customer.id,name.trim(),new Date().toISOString());
+    res.status(201).json({ id, name: name.trim() });
+  });
+  app.get('/api/customer/repositories/:id/tasks', requireCustomer, (req: Request, res: Response) => {
+    const repo = workspaceDatabase.prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?').get(req.params.id,res.locals.customer.id);
+    if (!repo) { res.status(404).json({ error: 'Repository not found' }); return; }
+    res.json(workspaceDatabase.prepare('SELECT id,title,status,created_at FROM customer_tasks WHERE repository_id=? ORDER BY created_at DESC').all(req.params.id));
+  });
+  app.post('/api/customer/repositories/:id/tasks', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const repo = workspaceDatabase.prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?').get(req.params.id,res.locals.customer.id);
+    if (!repo) { res.status(404).json({ error: 'Repository not found' }); return; }
+    const title = req.body?.title;
+    if (typeof title !== 'string' || !title.trim() || title.length > 250) { res.status(400).json({ error: 'Invalid task title' }); return; }
+    const id = crypto.randomUUID();
+    workspaceDatabase.prepare('INSERT INTO customer_tasks (id,repository_id,title,created_at) VALUES (?,?,?,?)').run(id,req.params.id,title.trim(),new Date().toISOString());
+    res.status(201).json({ id, title: title.trim(), status: 'todo' });
+  });
+  app.patch('/api/customer/tasks/:id', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const status = req.body?.status;
+    if (!['todo','in_progress','done'].includes(status)) { res.status(400).json({ error: 'Invalid status' }); return; }
+    const updated = workspaceDatabase.prepare(`UPDATE customer_tasks SET status=? WHERE id=? AND repository_id IN
+      (SELECT id FROM customer_repositories WHERE customer_id=?)`).run(status,req.params.id,res.locals.customer.id);
+    if (!updated.changes) { res.status(404).json({ error: 'Task not found' }); return; }
+    res.json({ id: req.params.id, status });
+  });
+  app.post('/api/customer/logout', (req: Request, res: Response) => {
+    const token = customerCookie(req);
+    if (token) customerAuth.logout(token);
+    res.setHeader('Set-Cookie', `lp_customer=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production ? '; Secure' : ''}`);
+    res.json({ status: 'logged_out' });
+  });
+  app.post('/auth/login', express.json({ limit: '4kb' }), (req: Request, res: Response) => {
+    const supplied = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (!accessToken || supplied.length !== accessToken.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))) {
+      res.status(401).json({ error: 'Invalid access token' }); return;
+    }
+    res.setHeader('Set-Cookie', `lp_session=${sessionSignature()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production ? '; Secure' : ''}`);
+    res.json({ status: 'authenticated' });
+  });
+  app.post('/auth/logout', (_req: Request, res: Response) => {
+    res.setHeader('Set-Cookie', 'lp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+    res.json({ status: 'logged_out' });
+  });
+  app.get('/auth/session', (req: Request, res: Response) => {
+    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+    const expected = sessionSignature();
+    res.json({ authenticated: Boolean(accessToken && cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))) });
+  });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (!production || req.path === '/healthz' || req.path === '/robots.txt' || req.path === '/' || req.path.startsWith('/assets/')) return next();
+    if (req.path.startsWith('/api/customer/')) return next();
+    if (req.path === '/api/v1/webhooks/git-core' || req.path === '/api/v1/billing/webhooks/stripe') return next();
+    if (!req.path.startsWith('/api/')) return next();
+    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+    const expected = sessionSignature();
+    if (cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))) {
+      if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.header('origin') && req.header('origin') !== `${req.protocol}://${req.get('host')}`) { res.status(403).json({ error: 'Origin mismatch' }); return; }
+      return next();
+    }
+    const supplied = req.header('Authorization')?.replace(/^Bearer\s+/i, '') || '';
+    if (!accessToken || supplied.length !== accessToken.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))) {
+      res.status(401).json({ error: 'Unauthorized' }); return;
+    }
+    next();
+  });
 
   // Layer B & Layer C Data Sovereignty Middleware
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -574,6 +731,17 @@ async function startServer() {
   app.use('/api/v1/webhooks/git-core', express.raw({ type: '*/*', limit: '5mb' }));
   app.use('/api/v1/billing/webhooks/stripe', express.raw({ type: '*/*', limit: '2mb' }));
   app.use(express.json({ limit: '5mb' }));
+  // Persist successful state-changing requests to the isolated runtime database.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      res.on('finish', () => {
+        if (res.statusCode < 400) {
+          try { persistWorkspace(); } catch (error) { console.error('Workspace persistence failed:', error); }
+        }
+      });
+    }
+    next();
+  });
 
   // Layer A: robots.txt
   app.get('/robots.txt', (_req: Request, res: Response) => {
@@ -600,6 +768,7 @@ async function startServer() {
       return;
     }
 
+    if (production) { res.status(503).json({ error: 'Live Stripe checkout is not configured' }); return; }
     const sessionId = `cs_test_${crypto.randomBytes(16).toString('hex')}`;
     const checkoutUrl = `https://checkout.stripe.com/c/pay/${sessionId}`;
 
@@ -623,6 +792,7 @@ async function startServer() {
   // POST /api/v1/billing/webhooks/stripe
   app.post('/api/v1/billing/webhooks/stripe', (req: Request, res: Response) => {
     const stripeSig = req.header('Stripe-Signature') || req.header('stripe-signature');
+    res.status(503).json({ error: 'Stripe webhooks disabled until signature verification is configured' }); return;
     let payload: any;
 
     try {
@@ -972,6 +1142,7 @@ async function startServer() {
 
   // Phase 1: Webhooks sign preview
   app.post('/api/v1/webhooks/sign-preview', (req: Request, res: Response) => {
+    if (production) { res.status(404).end(); return; }
     const raw = typeof req.body?.rawPayload === 'string' ? req.body.rawPayload : JSON.stringify(req.body?.payload || {});
     const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(Buffer.from(raw)).digest('hex');
     res.json({ signature: sig });
@@ -986,11 +1157,13 @@ async function startServer() {
       return;
     }
     const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex');
-    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig.toLowerCase().replace('sha256=', '')))) {
+    const normalizedSig = sig.toLowerCase().replace(/^sha256=/, '');
+    if (!/^[a-f0-9]{64}$/.test(normalizedSig) || !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(normalizedSig))) {
       res.status(401).json({ error: 'Signature mismatch' });
       return;
     }
-    const payload = JSON.parse(raw.toString('utf-8'));
+    let payload: any;
+    try { payload = JSON.parse(raw.toString('utf-8')); } catch { res.status(400).json({ error: 'Invalid JSON' }); return; }
     res.json({ status: 'committed', repository_id: payload.repository?.id, processed_commits: payload.commits?.length || 0 });
   });
 
@@ -1132,6 +1305,7 @@ async function startServer() {
 
   // State reset
   app.post('/api/v1/state/reset', (_req: Request, res: Response) => {
+    if (production) { res.status(403).json({ error: 'Reset disabled in production' }); return; }
     db = createInitialStore();
     res.json({ status: 'reset' });
   });

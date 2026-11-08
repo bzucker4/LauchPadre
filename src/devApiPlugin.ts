@@ -2,7 +2,7 @@ import type { Plugin, ViteDevServer } from 'vite';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { database, RepositoryRow, PanicSnapshotRow, AcademicDoiRow, TaskRow } from './db';
+import { database, RepositoryRow, PanicSnapshotRow, AcademicDoiRow, TaskRow } from './db.ts';
 
 // ============================================================================
 // 1. DATA SOVEREIGNTY CONSTANTS & ROBOTS.TXT

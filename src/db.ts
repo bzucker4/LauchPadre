@@ -1,4 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs';
+import path from 'node:path';
 import crypto from 'crypto';
 
 // ============================================================================
@@ -118,7 +120,8 @@ export class LaunchPadreDatabase {
   constructor(dbPath: string = ':memory:') {
     this.db = new DatabaseSync(dbPath);
     this.initSchema();
-    this.seedInitialData();
+    const existingUsers = this.db.prepare('SELECT COUNT(*) AS total FROM users').get() as { total: number };
+    if (existingUsers.total === 0 && process.env.NODE_ENV !== 'production' && process.env.LAUNCHPADRE_SEED_DEMO === 'true') this.seedInitialData();
   }
 
   private initSchema() {
@@ -364,4 +367,6 @@ export class LaunchPadreDatabase {
 }
 
 // Global database instance
-export const database = new LaunchPadreDatabase();
+const relationalPath = process.env.LAUNCHPADRE_RELATIONAL_DB || path.join(process.cwd(), 'data', 'relational-runtime.db');
+fs.mkdirSync(path.dirname(relationalPath), { recursive: true });
+export const database = new LaunchPadreDatabase(relationalPath);
