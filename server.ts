@@ -1,4 +1,5 @@
 import { CustomerBilling } from './src/customerBilling.ts';
+import { CustomerCheckpoints, CheckpointError } from './src/customerCheckpoints.ts';
 import { repositoryLimitReached } from './src/plans.ts';
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
@@ -627,6 +628,28 @@ async function startServer() {
     res.locals.customer = customer;
     next();
   };
+  const checkpoints = new CustomerCheckpoints(workspaceDatabase, process.env.LAUNCHPADRE_CUSTOMER_GIT_ROOT);
+  function checkpointResponse(res: Response, action: () => unknown, status = 200) {
+    try { res.status(status).json(action()); }
+    catch (error) {
+      if (error instanceof CheckpointError) { res.status(error.status).json({ error: error.message }); return; }
+      const message = error instanceof Error && !('code' in error) && !('status' in error)
+        ? error.message : 'Git operation failed. Verify the repository path and Git state with your workspace operator.';
+      res.status(409).json({ error: message });
+    }
+  }
+  app.get('/api/customer/repositories/:id/checkpoints', requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.info(res.locals.customer, String(req.params.id)));
+  });
+  app.put('/api/customer/repositories/:id/git', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.bind(res.locals.customer, String(req.params.id), req.body?.relative_path));
+  });
+  app.post('/api/customer/repositories/:id/checkpoints', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.create(res.locals.customer, String(req.params.id), req.body?.name), 201);
+  });
+  app.post('/api/customer/repositories/:id/restore', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.rollback(res.locals.customer, String(req.params.id), req.body || {}));
+  });
   app.get('/api/customer/billing/offers', requireCustomer, (_req, res) => {
     res.json({ plan: res.locals.customer.plan, offers: customerBilling.offers() });
   });

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import CustomerCheckpoints from './CustomerCheckpoints.tsx';
 type Repo = {id:string;name:string;created_at:string};
 type Task = {id:string;title:string;status:string};
 type Offer = {plan:string;interval:string;name:string;cents:number};
@@ -102,6 +103,7 @@ export default function CustomerWorkspace({onLogout,checkoutReturn}:{onLogout:()
           </label>
         ) : <p className="mt-4 text-sm text-slate-300">Add a repository to start tracking tasks.</p>}
       </section>
+      {selected && <CustomerCheckpoints key={selected} repositoryId={selected} />}
       {selected && (
         <section className={panel} aria-labelledby="tasks-title">
           <h2 id="tasks-title" className="text-xl font-semibold">Tasks</h2>
