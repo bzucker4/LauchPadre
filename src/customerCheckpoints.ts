@@ -85,7 +85,8 @@ export class CustomerCheckpoints {
       const tag = `panic_room_launchpadre_${name}`;
       const existing = current.find(snapshot => snapshot.tag === tag);
       if (existing) return existing;
-      const account = this.db.prepare('SELECT plan FROM customer_accounts WHERE id=?').get(customer.id);
+      const account = this.db.prepare("SELECT CASE WHEN billing_mode=? THEN plan ELSE 'free' END AS plan FROM customer_accounts WHERE id=?")
+        .get(process.env.STRIPE_MODE || 'test', customer.id);
       if (snapshotLimitReached(account?.plan as PlanId, current.length)) {
         throw new CheckpointError(402, 'Free Developer allows one checkpoint per repository');
       }

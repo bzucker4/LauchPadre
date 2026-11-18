@@ -11,13 +11,18 @@ export class CustomerAuth {
       token_hash TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
       expires_at INTEGER NOT NULL
     );`);
+    const columns = db.prepare('PRAGMA table_info(customer_accounts)').all();
+    if (!columns.some(column => column.name === 'email_verified_at')) {
+      db.exec('ALTER TABLE customer_accounts ADD COLUMN email_verified_at TEXT');
+    }
+    if (!columns.some(column => column.name === 'billing_mode')) {
+      db.exec("ALTER TABLE customer_accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'test' CHECK(billing_mode IN ('test','live'))");
+    }
   }
   register(emailInput: string, password: string) {
     const email = emailInput.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new Error('Invalid email');
-    if (password.length < 12 || password.length > 1024) throw new Error('Password must be 12-1024 characters');
-    const salt = randomBytes(16).toString('hex');
-    const passwordHash = `${salt}:${scryptSync(password, Buffer.from(salt, 'hex'), 64).toString('hex')}`;
+    const passwordHash = this.passwordHash(password);
     const id = randomBytes(16).toString('hex');
     this.db.prepare('INSERT INTO customer_accounts (id,email,password_hash,created_at) VALUES (?,?,?,?)').run(id,email,passwordHash,new Date().toISOString());
     return { id, email, plan: 'free' as const };
@@ -35,8 +40,20 @@ export class CustomerAuth {
   }
   session(token: string) {
     if (!/^[a-f0-9]{64}$/.test(token)) return null;
-    return this.db.prepare(`SELECT a.id,a.email,a.plan FROM customer_sessions s JOIN customer_accounts a ON a.id=s.customer_id WHERE s.token_hash=? AND s.expires_at>?`).get(this.hash(token),Date.now()) as {id:string,email:string,plan:string}|undefined || null;
+    return this.db.prepare(`SELECT a.id,a.email,CASE WHEN a.billing_mode=? THEN a.plan ELSE 'free' END AS plan,a.email_verified_at
+      FROM customer_sessions s JOIN customer_accounts a ON a.id=s.customer_id WHERE s.token_hash=? AND s.expires_at>?`)
+      .get(process.env.STRIPE_MODE || 'test',this.hash(token),Date.now()) as {id:string,email:string,plan:string,email_verified_at:string|null}|undefined || null;
+  }
+  setPassword(customerId: string, password: string) {
+    const hashed = this.passwordHash(password);
+    this.db.prepare('UPDATE customer_accounts SET password_hash=? WHERE id=?').run(hashed, customerId);
+    this.db.prepare('DELETE FROM customer_sessions WHERE customer_id=?').run(customerId);
   }
   logout(token:string) { this.db.prepare('DELETE FROM customer_sessions WHERE token_hash=?').run(this.hash(token)); }
   private hash(token:string) { return createHash('sha256').update(token).digest('hex'); }
+  private passwordHash(password: string) {
+    if (password.length < 12 || password.length > 1024) throw new Error('Password must be 12-1024 characters');
+    const salt = randomBytes(16).toString('hex');
+    return `${salt}:${scryptSync(password, Buffer.from(salt, 'hex'), 64).toString('hex')}`;
+  }
 }

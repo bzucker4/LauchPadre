@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import CustomerCheckpoints from './CustomerCheckpoints.tsx';
+import AccountAccess from './AccountAccess.tsx';
 type Repo = {id:string;name:string;created_at:string};
 type Task = {id:string;title:string;status:string};
 type Offer = {plan:string;interval:string;name:string;cents:number};
@@ -9,7 +10,7 @@ const button = 'rounded-lg border border-slate-600 bg-slate-800 px-4 py-2.5 text
 const primary = 'rounded-lg bg-amber-400 px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-amber-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 disabled:opacity-50';
 
 function Billing({ checkoutReturn }: { checkoutReturn: string | null }) {
-  const [billing, setBilling] = useState<{plan:string;offers:Offer[]}>();
+  const [billing, setBilling] = useState<{plan:string;offers:Offer[];mode:string;portal_available:boolean;review_pending:boolean;checkout_pending:boolean}>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   async function refresh() {
@@ -29,9 +30,20 @@ function Billing({ checkoutReturn }: { checkoutReturn: string | null }) {
         body: JSON.stringify({ plan: offer.plan, interval: offer.interval }),
       });
       const result = await response.json();
-      if (!response.ok) { setError(result.error || 'Could not start checkout'); return; }
+      if (!response.ok) { await refresh(); setError(result.error || 'Could not start checkout'); return; }
       window.location.assign(result.url);
     } catch { setError('Could not start checkout'); }
+    finally { setBusy(false); }
+  }
+  async function manage(route: 'portal' | 'cancel-checkout') {
+    setBusy(true); setError('');
+    try {
+      const response = await fetch('/api/customer/billing/' + route, { method: 'POST' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Billing request failed');
+      if (route === 'portal') window.location.assign(result.url);
+      else await refresh();
+    } catch (error) { setError(error instanceof Error ? error.message : 'Billing request failed'); }
     finally { setBusy(false); }
   }
   const current = billing?.plan === 'academic_tier' ? 'Academic Researcher' :
@@ -50,10 +62,13 @@ function Billing({ checkoutReturn }: { checkoutReturn: string | null }) {
       {checkoutReturn === 'success' && <p role="status" className="mt-4 rounded-lg border border-blue-900 bg-blue-950/60 p-3 text-sm text-blue-200">You returned from Stripe. If your payment is still processing, refresh your plan to check its status.</p>}
       {checkoutReturn === 'canceled' && <p role="status" className="mt-4 text-sm text-slate-300">Checkout was canceled.</p>}
       {error && <p role="alert" className="mt-4 text-sm text-red-300">{error}</p>}
-      {billing && !billing.offers.length && <p className="mt-4 text-sm text-slate-300">Test checkout is unavailable.</p>}
+      {billing?.review_pending && <p role="status" className="mt-4 text-sm text-amber-300">A billing event needs review. Contact your workspace operator.</p>}
+      {billing?.portal_available && <button type="button" className={button + ' mt-4'} disabled={busy} onClick={() => void manage('portal')}>Manage subscription</button>}
+      {billing?.checkout_pending && <button type="button" className={button + ' ml-3 mt-4'} disabled={busy} onClick={() => void manage('cancel-checkout')}>Cancel pending checkout</button>}
+      {billing && !billing.offers.length && <p className="mt-4 text-sm text-slate-300">Checkout is unavailable.</p>}
       {billing?.plan === 'free' && billing.offers.length > 0 && (
         <div className="mt-5">
-          <h3 className="mb-3 text-sm font-semibold text-slate-300">Stripe sandbox plans</h3>
+          <h3 className="mb-3 text-sm font-semibold text-slate-300">{billing.mode === 'live' ? 'Available plans' : 'Stripe sandbox plans'}</h3>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {billing.offers.map(offer => (
               <button key={offer.plan + offer.interval} type="button" className="rounded-xl border border-slate-700 bg-slate-950 p-4 text-left hover:border-amber-400 focus-visible:outline-2 focus-visible:outline-amber-400 disabled:opacity-50" disabled={busy} onClick={() => void checkout(offer)}>
@@ -83,6 +98,7 @@ export default function CustomerWorkspace({onLogout,checkoutReturn}:{onLogout:()
         <button type="button" className={button} onClick={async () => { await fetch('/api/customer/logout', { method: 'POST' }); onLogout(); }}>Log out</button>
       </header>
       <Billing checkoutReturn={checkoutReturn} />
+      <AccountAccess />
       {error && <p role="alert" className="rounded-lg border border-red-900 p-3 text-sm text-red-300">{error}</p>}
       <section className={panel} aria-labelledby="repositories-title">
         <h2 id="repositories-title" className="text-xl font-semibold">Repositories</h2>
