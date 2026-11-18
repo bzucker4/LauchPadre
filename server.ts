@@ -1,4 +1,5 @@
 import { CustomerBilling } from './src/customerBilling.ts';
+import 'dotenv/config';
 import { CustomerCheckpoints, CheckpointError } from './src/customerCheckpoints.ts';
 import { repositoryLimitReached } from './src/plans.ts';
 import express, { Request, Response, NextFunction } from 'express';
@@ -7,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
+import { AccountMailer, AccountRecovery } from './src/accountRecovery.ts';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 
@@ -554,7 +556,14 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 
 async function startServer() {
   const app = express();
+  if (process.env.LAUNCHPADRE_TRUST_PROXY === 'loopback') app.set('trust proxy', 'loopback');
   const customerAuth = new CustomerAuth(workspaceDatabase);
+  const accountRecovery = new AccountRecovery(workspaceDatabase, customerAuth);
+  const accountMailer = new AccountMailer();
+  const requireVerifiedEmail = process.env.LAUNCHPADRE_REQUIRE_VERIFIED_EMAIL === 'true';
+  if (requireVerifiedEmail && !accountMailer.configured) {
+    throw new Error('Required email verification needs RESEND_API_KEY, LAUNCHPADRE_EMAIL_FROM and LAUNCHPADRE_PUBLIC_ORIGIN');
+  }
   const customerBilling = new CustomerBilling(workspaceDatabase);
   app.disable('x-powered-by');
   const production = process.env.NODE_ENV === 'production';
@@ -565,6 +574,27 @@ async function startServer() {
     throw new Error('Production requires LAUNCHPADRE_ACCESS_TOKEN and WEBHOOK_SECRET (32+ characters each)');
   }
   app.get('/healthz', (_req: Request, res: Response) => res.json({ status: 'ok' }));
+  app.get('/api/public-info', (_req, res) => {
+    const httpsLink = (value: string | undefined) => {
+      try {
+        const url = new URL(value || '');
+        return url.protocol === 'https:' && !url.username && !url.password ? url.href : '';
+      } catch { return ''; }
+    };
+    const support = process.env.LAUNCHPADRE_SUPPORT_EMAIL || '';
+    res.json({
+      support_email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(support) ? support : '',
+      privacy_url: httpsLink(process.env.LAUNCHPADRE_PRIVACY_URL),
+      terms_url: httpsLink(process.env.LAUNCHPADRE_TERMS_URL),
+    });
+  });
+  app.get('/readyz', (_req, res) => {
+    try {
+      workspaceDatabase.prepare('SELECT 1').get();
+      if (production && !fs.existsSync(path.join(__dirname, 'dist', 'index.html'))) throw new Error('Build missing');
+      res.json({ status: 'ready' });
+    } catch { res.status(503).json({ status: 'unavailable' }); }
+  });
   app.use((_req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -577,6 +607,12 @@ async function startServer() {
   const authThrottle = (req: Request, res: Response, next: NextFunction) => {
     const key = req.ip || 'unknown';
     const now = Date.now();
+    for (const [address, entry] of registrationAttempts) {
+      if (entry.resetAt <= now) registrationAttempts.delete(address);
+    }
+    if (registrationAttempts.size >= 10_000 && !registrationAttempts.has(key)) {
+      res.status(429).json({ error: 'Too many attempts' }); return;
+    }
     const prior = registrationAttempts.get(key);
     const entry = prior && prior.resetAt > now ? prior : { count: 0, resetAt: now + 15 * 60_000 };
     entry.count += 1;
@@ -584,6 +620,36 @@ async function startServer() {
     if (entry.count > 20) { res.status(429).json({ error: 'Too many attempts' }); return; }
     next();
   };
+  app.get('/api/customer/auth-options', (_req, res) => {
+    res.json({ email_enabled: accountMailer.configured, require_verified_email: requireVerifiedEmail });
+  });
+  app.post('/api/customer/request-reset', express.json({ limit: '4kb' }), authThrottle, async (req, res) => {
+    if (!accountMailer.configured) { res.status(503).json({ error: 'Email recovery is unavailable. Contact your workspace operator.' }); return; }
+    try {
+      if (typeof req.body?.email === 'string' && req.body.email.length <= 254 && accountRecovery.allowEmail(req.body.email, 'reset')) {
+        const issued = accountRecovery.issue(req.body.email, 'reset');
+        if (issued) {
+          void accountMailer.send('reset', issued.email, issued.token).catch(() => console.error('ACCOUNT_EMAIL_DELIVERY_FAILED'));
+        }
+      }
+    } catch { console.error('ACCOUNT_RECOVERY_REQUEST_FAILED'); }
+    // The provider request runs independently so response timing does not reveal account existence.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    res.status(202).json({ message: 'If this address has an account, a password reset link has been requested.' });
+  });
+  app.post('/api/customer/reset-password', express.json({ limit: '4kb' }), authThrottle, (req, res) => {
+    try {
+      const email = accountRecovery.consume(req.body?.token, 'reset', req.body?.password);
+      if (accountMailer.configured) void accountMailer.passwordChanged(email).catch(() => console.error('ACCOUNT_EMAIL_DELIVERY_FAILED'));
+      res.json({ message: 'Password reset. Sign in with your new password.' });
+    } catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid reset link' }); }
+  });
+  app.post('/api/customer/verify-email', express.json({ limit: '4kb' }), authThrottle, (req, res) => {
+    try {
+      accountRecovery.consume(req.body?.token, 'verify');
+      res.json({ message: 'Email address verified. You can return to your workspace.' });
+    } catch { res.status(400).json({ error: 'This link is invalid or expired' }); }
+  });
   app.post('/api/customer/register', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
     try {
       const email = req.body?.email;
@@ -629,6 +695,15 @@ async function startServer() {
     next();
   };
   const checkpoints = new CustomerCheckpoints(workspaceDatabase, process.env.LAUNCHPADRE_CUSTOMER_GIT_ROOT);
+  app.post('/api/customer/request-verification', requireCustomer, authThrottle, async (_req, res) => {
+    if (!accountMailer.configured) { res.status(503).json({ error: 'Email verification is unavailable. Contact your workspace operator.' }); return; }
+    try {
+      const issued = accountRecovery.allowEmail(res.locals.customer.email, 'verify')
+        ? accountRecovery.issue(res.locals.customer.email, 'verify') : null;
+      if (issued) await accountMailer.send('verify', issued.email, issued.token);
+    } catch { res.status(502).json({ error: 'Could not send verification email. Please try again later.' }); return; }
+    res.json({ message: 'Check your email for a verification link.' });
+  });
   function checkpointResponse(res: Response, action: () => unknown, status = 200) {
     try { res.status(status).json(action()); }
     catch (error) {
@@ -651,12 +726,23 @@ async function startServer() {
     checkpointResponse(res, () => checkpoints.rollback(res.locals.customer, String(req.params.id), req.body || {}));
   });
   app.get('/api/customer/billing/offers', requireCustomer, (_req, res) => {
-    res.json({ plan: res.locals.customer.plan, offers: customerBilling.offers() });
+    res.json({ plan: res.locals.customer.plan, offers: customerBilling.offers(), ...customerBilling.details(res.locals.customer.id) });
+  });
+  app.post('/api/customer/billing/portal', requireCustomer, async (_req, res) => {
+    try { res.json(await customerBilling.portal(res.locals.customer.id)); }
+    catch { res.status(502).json({ error: 'Billing management is unavailable. Contact your workspace operator.' }); }
+  });
+  app.post('/api/customer/billing/cancel-checkout', requireCustomer, async (_req, res) => {
+    try { res.json(await customerBilling.cancelCheckout(res.locals.customer.id)); }
+    catch { res.status(409).json({ error: 'Could not cancel this checkout. Refresh your plan or contact your workspace operator.' }); }
   });
   app.post('/api/customer/billing/checkout', express.json({ limit: '4kb' }), requireCustomer, async (req, res) => {
+    if (requireVerifiedEmail && !res.locals.customer.email_verified_at) {
+      res.status(403).json({ error: 'Verify your email before starting checkout' }); return;
+    }
     const { plan, interval } = req.body || {};
     if (!customerBilling.offers().some(offer => offer.plan === plan && offer.interval === interval)) {
-      res.status(503).json({ error: 'This test checkout is unavailable' });
+      res.status(503).json({ error: 'This checkout is unavailable' });
       return;
     }
     try {
@@ -1311,9 +1397,12 @@ async function startServer() {
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, process.env.LAUNCHPADRE_BIND_HOST || '0.0.0.0', () => {
     console.log(`LaunchPadre Phase 2 Engine listening on port ${PORT}`);
   });
+  const stop = () => httpServer.close(() => { workspaceDatabase.close(); process.exit(0); });
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
 }
 
 startServer();
