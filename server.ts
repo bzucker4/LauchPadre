@@ -1,3 +1,5 @@
+import { CustomerBilling } from './src/customerBilling.ts';
+import { repositoryLimitReached } from './src/plans.ts';
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -16,8 +18,6 @@ const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(proce
 const PORT = cliPort && !isNaN(cliPort) ? cliPort : 3000;
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
-const STRIPE_WEBHOOK_SECRET =
-  process.env.STRIPE_WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
 
 // ============================================================================
 // 1. TIMEZONE FORMATTER & AUDIT LOGGING
@@ -554,6 +554,7 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 async function startServer() {
   const app = express();
   const customerAuth = new CustomerAuth(workspaceDatabase);
+  const customerBilling = new CustomerBilling(workspaceDatabase);
   app.disable('x-powered-by');
   const production = process.env.NODE_ENV === 'production';
   const accessToken = process.env.LAUNCHPADRE_ACCESS_TOKEN;
@@ -626,12 +627,32 @@ async function startServer() {
     res.locals.customer = customer;
     next();
   };
+  app.get('/api/customer/billing/offers', requireCustomer, (_req, res) => {
+    res.json({ plan: res.locals.customer.plan, offers: customerBilling.offers() });
+  });
+  app.post('/api/customer/billing/checkout', express.json({ limit: '4kb' }), requireCustomer, async (req, res) => {
+    const { plan, interval } = req.body || {};
+    if (!customerBilling.offers().some(offer => offer.plan === plan && offer.interval === interval)) {
+      res.status(503).json({ error: 'This test checkout is unavailable' });
+      return;
+    }
+    try {
+      res.json(await customerBilling.checkout(res.locals.customer, plan, interval));
+    } catch {
+      res.status(502).json({ error: 'Checkout could not start. Check Stripe configuration or manage an existing subscription.' });
+    }
+  });
   app.get('/api/customer/repositories', requireCustomer, (_req: Request, res: Response) => {
     res.json(workspaceDatabase.prepare('SELECT id,name,created_at FROM customer_repositories WHERE customer_id=? ORDER BY created_at DESC').all(res.locals.customer.id));
   });
   app.post('/api/customer/repositories', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
     const name = req.body?.name;
     if (typeof name !== 'string' || !name.trim() || name.length > 120) { res.status(400).json({ error: 'Invalid repository name' }); return; }
+    const count = workspaceDatabase.prepare('SELECT COUNT(*) AS total FROM customer_repositories WHERE customer_id=?').get(res.locals.customer.id);
+    if (repositoryLimitReached(res.locals.customer.plan, Number(count?.total))) {
+      res.status(402).json({ error: 'Your plan allows three repositories' });
+      return;
+    }
     const id = crypto.randomUUID();
     workspaceDatabase.prepare('INSERT INTO customer_repositories (id,customer_id,name,created_at) VALUES (?,?,?,?)').run(id,res.locals.customer.id,name.trim(),new Date().toISOString());
     res.status(201).json({ id, name: name.trim() });
@@ -790,79 +811,13 @@ async function startServer() {
   });
 
   // POST /api/v1/billing/webhooks/stripe
-  app.post('/api/v1/billing/webhooks/stripe', (req: Request, res: Response) => {
-    const stripeSig = req.header('Stripe-Signature') || req.header('stripe-signature');
-    res.status(503).json({ error: 'Stripe webhooks disabled until signature verification is configured' }); return;
-    let payload: any;
-
+  app.post('/api/v1/billing/webhooks/stripe', async (req, res) => {
+    if (!Buffer.isBuffer(req.body)) { res.sendStatus(400); return; }
     try {
-      const rawString = Buffer.isBuffer(req.body) ? req.body.toString('utf-8') : JSON.stringify(req.body || {});
-      payload = JSON.parse(rawString);
+      res.sendStatus(await customerBilling.webhook(req.body, req.header('Stripe-Signature') || ''));
     } catch {
-      res.status(400).json({ error: 'Malformed Stripe webhook JSON payload' });
-      return;
+      res.sendStatus(502);
     }
-
-    const eventType = payload.type || req.body?.type;
-    const eventObject = payload.data?.object || req.body?.data?.object || {};
-
-    if (eventType === 'checkout.session.completed') {
-      const clientRefId = Number(eventObject.client_reference_id || req.body?.user_id || 1);
-      const planId = eventObject.metadata?.plan_id || 'indie_solo';
-      const customerId = eventObject.customer || `cus_${crypto.randomBytes(6).toString('hex')}`;
-      const subId = eventObject.subscription || `sub_${crypto.randomBytes(8).toString('hex')}`;
-
-      const user = db.users.find((u) => u.id === clientRefId) || db.users[0];
-      if (user) {
-        user.plan = planId as any;
-        user.is_premium = true;
-        user.stripe_customer_id = customerId;
-        user.stripe_subscription_id = subId;
-        user.updated_at = formatLocalIsoOffset(new Date());
-
-        recordLog(
-          'INFO',
-          'STRIPE_SUBSCRIPTION_ACTIVATED',
-          200,
-          `Upgraded user #${user.id} ('${user.username}') to ${planId}. Stripe Customer: ${customerId}`
-        );
-      }
-
-      res.json({
-        status: 'user_upgraded_to_premium',
-        event_type: eventType,
-        user_id: user?.id,
-        customer_id: customerId,
-        processed: true,
-      });
-      return;
-    } else if (eventType === 'customer.subscription.deleted') {
-      const customerId = eventObject.customer || req.body?.customer_id;
-      const user = db.users.find((u) => u.stripe_customer_id === customerId) || db.users[0];
-      if (user) {
-        user.plan = 'free';
-        user.is_premium = false;
-        user.stripe_subscription_id = null;
-        user.updated_at = formatLocalIsoOffset(new Date());
-
-        recordLog(
-          'WARNING',
-          'STRIPE_SUBSCRIPTION_DELETED',
-          200,
-          `Downgraded user #${user.id} ('${user.username}') to free tier. Customer: ${customerId}`
-        );
-      }
-
-      res.json({
-        status: 'user_downgraded_to_free',
-        event_type: eventType,
-        customer_id: customerId,
-        processed: true,
-      });
-      return;
-    }
-
-    res.json({ status: 'acknowledged', event_type: eventType, processed: false });
   });
 
   // ==========================================================================
