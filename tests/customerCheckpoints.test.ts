@@ -82,5 +82,18 @@ test('customer checkpoints preserve real Git commits, quotas, isolation and reco
     assert.equal(checkpoints.info(a, 'a-repo').snapshots.length, 2);
     const recovered = checkpoints.rollback(a, 'a-repo', { tag: 'panic_room_launchpadre_second', expected_head: first.head, expected_target: secondHead });
     assert.equal(recovered.target, secondHead);
+
+    // archiveZip exports committed HEAD only and never includes untracked files
+    fs.writeFileSync(path.join(directory, 'secret-untracked.txt'), 'do not archive');
+    const archived = checkpoints.archive(a, 'a-repo');
+    assert.equal(archived.head, secondHead);
+    assert.equal(archived.zip.subarray(0, 2).toString('utf8'), 'PK');
+    assert.equal(archived.zip.includes(Buffer.from('work.txt')), true);
+    assert.equal(archived.zip.includes(Buffer.from('secret-untracked.txt')), false);
+    fs.unlinkSync(path.join(directory, 'secret-untracked.txt'));
+
+    // Non-existent Git root returns clean 503 CheckpointError
+    const missingRoot = new CustomerCheckpoints(db, path.join(root, 'does-not-exist'));
+    assert.throws(() => missingRoot.info(a, 'a-repo'), /does not exist/);
   } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });

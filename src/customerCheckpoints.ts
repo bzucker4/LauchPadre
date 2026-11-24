@@ -28,6 +28,9 @@ export class CustomerCheckpoints {
 
   private workspace(customer: Customer) {
     if (!this.root) throw new CheckpointError(503, 'Git checkpoints need a configured customer Git root');
+    if (!fs.existsSync(this.root)) {
+      throw new CheckpointError(503, 'Configured customer Git root directory does not exist');
+    }
     if (!/^[a-f0-9]{32}$/.test(customer.id)) throw new CheckpointError(400, 'Invalid customer');
     const base = fs.realpathSync(this.root);
     const tenant = path.join(base, customer.id);
@@ -46,29 +49,72 @@ export class CustomerCheckpoints {
     return row.relative_path;
   }
 
+  private runTransaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {}
+      throw error;
+    }
+  }
+
   info(customer: Customer, repositoryId: string) {
     this.owned(customer, repositoryId);
     const row = this.db.prepare('SELECT relative_path FROM customer_git_bindings WHERE repository_id=? AND customer_id=?')
       .get(repositoryId, customer.id) as { relative_path: string } | undefined;
-    if (!row) return { enabled: Boolean(this.root), customer_directory: customer.id, relative_path: null, head: '', branch: '', unborn: true, snapshots: [] };
+    if (!row) {
+      return {
+        enabled: Boolean(this.root && fs.existsSync(this.root)),
+        customer_directory: customer.id,
+        relative_path: null,
+        head: '',
+        branch: '',
+        unborn: true,
+        snapshots: [],
+      };
+    }
     const git = this.workspace(customer);
     return {
-      enabled: true, customer_directory: customer.id, relative_path: row.relative_path,
-      ...git.inspect(row.relative_path), snapshots: git.snapshots(row.relative_path),
+      enabled: true,
+      customer_directory: customer.id,
+      relative_path: row.relative_path,
+      ...git.inspect(row.relative_path),
+      snapshots: git.snapshots(row.relative_path),
     };
   }
 
   bind(customer: Customer, repositoryId: string, relative: unknown) {
     this.owned(customer, repositoryId);
-    if (typeof relative !== 'string' || relative.length > 500) throw new CheckpointError(400, 'Enter a relative Git repository path');
-    const git = this.workspace(customer);
-    git.resolve(relative);
-    const existing = this.db.prepare('SELECT relative_path FROM customer_git_bindings WHERE repository_id=?').get(repositoryId);
-    if (existing && existing.relative_path !== relative) throw new CheckpointError(409, 'This repository already has a Git connection');
-    const used = this.db.prepare('SELECT repository_id FROM customer_git_bindings WHERE customer_id=? AND relative_path=?').get(customer.id, relative);
-    if (used && used.repository_id !== repositoryId) throw new CheckpointError(409, 'This Git repository is already connected');
-    this.db.prepare('INSERT OR IGNORE INTO customer_git_bindings VALUES (?,?,?)').run(repositoryId, customer.id, relative);
-    return this.info(customer, repositoryId);
+    if (typeof relative !== 'string' || relative.length > 500) {
+      throw new CheckpointError(400, 'Enter a relative Git repository path');
+    }
+    const normalized = relative.trim().replace(/\/+$/, '');
+    if (!normalized) throw new CheckpointError(400, 'Enter a relative Git repository path');
+    return this.runTransaction(() => {
+      const git = this.workspace(customer);
+      git.resolve(normalized);
+      const existing = this.db
+        .prepare('SELECT relative_path FROM customer_git_bindings WHERE repository_id=?')
+        .get(repositoryId);
+      if (existing && existing.relative_path !== normalized) {
+        throw new CheckpointError(409, 'This repository already has a Git connection');
+      }
+      const used = this.db
+        .prepare('SELECT repository_id FROM customer_git_bindings WHERE customer_id=? AND relative_path=?')
+        .get(customer.id, normalized);
+      if (used && used.repository_id !== repositoryId) {
+        throw new CheckpointError(409, 'This Git repository is already connected');
+      }
+      this.db
+        .prepare('INSERT OR IGNORE INTO customer_git_bindings VALUES (?,?,?)')
+        .run(repositoryId, customer.id, normalized);
+      return this.info(customer, repositoryId);
+    });
   }
 
   create(customer: Customer, repositoryId: string, name: unknown) {
@@ -77,8 +123,7 @@ export class CustomerCheckpoints {
     }
     // The SQLite write lock serializes quota checks and Git writes across app processes.
     // Git refs are the durable checkpoint records, including after an interrupted request.
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runTransaction(() => {
       const relative = this.binding(customer, repositoryId);
       const git = this.workspace(customer);
       const current = git.snapshots(relative);
@@ -90,18 +135,28 @@ export class CustomerCheckpoints {
         throw new CheckpointError(402, 'Free Developer allows one checkpoint per repository');
       }
       return git.snapshot(relative, name);
-    } finally { this.db.exec('COMMIT'); }
+    });
   }
 
   rollback(customer: Customer, repositoryId: string, input: { tag?: unknown; expected_head?: unknown; expected_target?: unknown }) {
-    if (typeof input.tag !== 'string' || typeof input.expected_head !== 'string' || typeof input.expected_target !== 'string' ||
-        !/^[a-f0-9]{40,64}$/.test(input.expected_head) || !/^[a-f0-9]{40,64}$/.test(input.expected_target)) {
+    if (
+      typeof input.tag !== 'string' ||
+      typeof input.expected_head !== 'string' ||
+      typeof input.expected_target !== 'string' ||
+      !/^[a-f0-9]{40,64}$/.test(input.expected_head) ||
+      !/^[a-f0-9]{40,64}$/.test(input.expected_target)
+    ) {
       throw new CheckpointError(400, 'Refresh the repository and select a checkpoint before restoring');
     }
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runTransaction(() => {
       const relative = this.binding(customer, repositoryId);
-      return this.workspace(customer).rollback(relative, input.tag, input.expected_head, input.expected_target);
-    } finally { this.db.exec('COMMIT'); }
+      return this.workspace(customer).rollback(relative, input.tag as string, input.expected_head as string, input.expected_target as string);
+    });
+  }
+
+  archive(customer: Customer, repositoryId: string) {
+    const relative = this.binding(customer, repositoryId);
+    const git = this.workspace(customer);
+    return { relativePath: relative, ...git.archiveZip(relative) };
   }
 }

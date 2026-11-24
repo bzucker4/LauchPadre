@@ -15,57 +15,157 @@ export class CustomerBilling {
 
   constructor(private db: DatabaseSync, private request = fetch) {
     db.exec(`CREATE TABLE IF NOT EXISTS stripe_customer_accounts (
-      account_id TEXT PRIMARY KEY REFERENCES customer_accounts(id),
+      account_id TEXT PRIMARY KEY REFERENCES customer_accounts(id) ON DELETE CASCADE,
       stripe_customer_id TEXT NOT NULL UNIQUE
     )`);
   }
 
+  mode(): 'live' | 'test' | null {
+    if (!this.secret.startsWith('whsec_')) return null;
+    if (/^(sk|rk)_live_/.test(this.key)) return 'live';
+    if (/^(sk|rk)_test_/.test(this.key)) return 'test';
+    return null;
+  }
+
+  private get livemode(): boolean {
+    return this.mode() === 'live';
+  }
+
   private configured() {
-    return /^(sk|rk)_test_/.test(this.key) && this.secret.startsWith('whsec_');
+    return this.mode() !== null;
+  }
+
+  private validOrigin(): URL | null {
+    if (!this.origin) return null;
+    try {
+      const origin = new URL(this.origin);
+      if (origin.origin !== this.origin) return null;
+      if (origin.protocol === 'https:') return origin;
+      if (!this.livemode && origin.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(origin.hostname)) {
+        return origin;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   offers() {
-    return this.configured() && this.origin ? this.prices.filter(p => p.id?.startsWith('price_')).map(p => ({
-      plan: p.plan, interval: p.interval, name: PLANS[p.plan].name,
-      cents: p.interval === 'month' ? PLANS[p.plan].monthly : PLANS[p.plan].annual,
-    })) : [];
+    return this.configured() && this.validOrigin()
+      ? this.prices
+          .filter(p => p.id?.startsWith('price_'))
+          .map(p => ({
+            plan: p.plan,
+            interval: p.interval,
+            name: PLANS[p.plan].name,
+            cents: p.interval === 'month' ? PLANS[p.plan].monthly : PLANS[p.plan].annual,
+          }))
+      : [];
+  }
+
+  hasBillingAccount(accountId: string): boolean {
+    if (!this.configured() || !this.validOrigin()) return false;
+    return Boolean(
+      this.db.prepare('SELECT 1 FROM stripe_customer_accounts WHERE account_id=?').get(accountId)
+    );
   }
 
   private async stripe(route: string, body?: URLSearchParams, idempotencyKey?: string) {
     const response = await this.request('https://api.stripe.com/v1/' + route, {
-      method: body ? 'POST' : 'GET', body, redirect: 'error',
-      headers: { Authorization: 'Bearer ' + this.key, ...(idempotencyKey ? {'Idempotency-Key': idempotencyKey} : {}) },
+      method: body ? 'POST' : 'GET',
+      body,
+      redirect: 'error',
+      headers: {
+        Authorization: 'Bearer ' + this.key,
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) throw new Error('Stripe request failed');
     return response.json();
   }
 
-  async checkout(account: {id: string; email: string}, plan: string, interval: string) {
+  async checkout(account: { id: string; email: string }, plan: string, interval: string) {
     const offer = this.offers().find(p => p.plan === plan && p.interval === interval);
     const price = this.prices.find(p => p.plan === plan && p.interval === interval)?.id;
     if (!offer || !price) throw new Error('Checkout unavailable');
-    const origin = new URL(this.origin);
-    if (origin.origin !== this.origin || (origin.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(origin.hostname))) throw new Error('Invalid Stripe return origin');
+    const origin = this.validOrigin();
+    if (!origin) throw new Error('Invalid Stripe return origin');
+    const expectedLivemode = this.livemode;
     const details = await this.stripe('prices/' + encodeURIComponent(price));
-    if (!details.active || details.livemode !== false || details.currency !== 'usd' || details.unit_amount !== offer.cents ||
-        details.recurring?.interval !== interval || details.recurring?.interval_count !== 1 ||
-        details.recurring?.usage_type !== 'licensed' || details.billing_scheme !== 'per_unit') throw new Error('Stripe price mismatch');
-    let mapping = this.db.prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?').get(account.id);
+    if (
+      !details.active ||
+      details.livemode !== expectedLivemode ||
+      details.currency !== 'usd' ||
+      details.unit_amount !== offer.cents ||
+      details.recurring?.interval !== interval ||
+      details.recurring?.interval_count !== 1 ||
+      details.recurring?.usage_type !== 'licensed' ||
+      details.billing_scheme !== 'per_unit'
+    ) {
+      throw new Error('Stripe price mismatch');
+    }
+    let mapping = this.db
+      .prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?')
+      .get(account.id);
     if (!mapping) {
-      const customer = await this.stripe('customers', new URLSearchParams({email: account.email, 'metadata[launchpadre_account]': account.id}), 'launchpadre-customer-' + account.id);
-      if (typeof customer.id !== 'string' || !customer.id.startsWith('cus_')) throw new Error('Invalid Stripe customer');
-      this.db.prepare('INSERT INTO stripe_customer_accounts VALUES (?,?) ON CONFLICT(account_id) DO NOTHING').run(account.id, customer.id);
-      mapping = this.db.prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?').get(account.id);
+      const customer = await this.stripe(
+        'customers',
+        new URLSearchParams({ email: account.email, 'metadata[launchpadre_account]': account.id }),
+        'launchpadre-customer-' + account.id
+      );
+      if (typeof customer.id !== 'string' || !customer.id.startsWith('cus_')) {
+        throw new Error('Invalid Stripe customer');
+      }
+      this.db
+        .prepare('INSERT INTO stripe_customer_accounts VALUES (?,?) ON CONFLICT(account_id) DO NOTHING')
+        .run(account.id, customer.id);
+      mapping = this.db
+        .prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?')
+        .get(account.id);
     }
     const customer = String(mapping!.stripe_customer_id);
     const subscriptions = await this.subscriptions(customer);
-    if (subscriptions.some(s => !['canceled','incomplete_expired'].includes(s.status))) throw new Error('Manage the existing subscription in Stripe');
-    const session = await this.stripe('checkout/sessions', new URLSearchParams({
-      mode: 'subscription', customer, client_reference_id: account.id, 'line_items[0][price]': price, 'line_items[0][quantity]': '1',
-      success_url: origin.origin + '/?checkout=success', cancel_url: origin.origin + '/?checkout=canceled',
-    }), 'launchpadre-checkout-' + account.id + '-' + price + '-' + Math.floor(Date.now() / 3600000));
-    if (typeof session.url !== 'string' || new URL(session.url).origin !== 'https://checkout.stripe.com') throw new Error('Invalid checkout URL');
+    if (subscriptions.some(s => !['canceled', 'incomplete_expired'].includes(s.status))) {
+      throw new Error('Manage the existing subscription in Stripe');
+    }
+    const session = await this.stripe(
+      'checkout/sessions',
+      new URLSearchParams({
+        mode: 'subscription',
+        customer,
+        client_reference_id: account.id,
+        'line_items[0][price]': price,
+        'line_items[0][quantity]': '1',
+        success_url: origin.origin + '/?checkout=success',
+        cancel_url: origin.origin + '/?checkout=canceled',
+      }),
+      'launchpadre-checkout-' + account.id + '-' + price + '-' + Math.floor(Date.now() / 3600000)
+    );
+    if (typeof session.url !== 'string' || new URL(session.url).origin !== 'https://checkout.stripe.com') {
+      throw new Error('Invalid checkout URL');
+    }
+    return { url: session.url };
+  }
+
+  async portal(account: { id: string }) {
+    if (!this.configured()) throw new Error('Billing unavailable');
+    const origin = this.validOrigin();
+    if (!origin) throw new Error('Invalid Stripe return origin');
+    const mapping = this.db
+      .prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?')
+      .get(account.id) as { stripe_customer_id: string } | undefined;
+    if (!mapping) throw new Error('No Stripe billing profile exists for this account');
+    const session = await this.stripe(
+      'billing_portal/sessions',
+      new URLSearchParams({
+        customer: mapping.stripe_customer_id,
+        return_url: origin.origin + '/',
+      })
+    );
+    if (typeof session.url !== 'string' || new URL(session.url).origin !== 'https://billing.stripe.com') {
+      throw new Error('Invalid billing portal URL');
+    }
     return { url: session.url };
   }
 
@@ -73,7 +173,7 @@ export class CustomerBilling {
     const items: any[] = [];
     let cursor: string | undefined;
     do {
-      const query = new URLSearchParams({customer, status: 'all', limit: '100'});
+      const query = new URLSearchParams({ customer, status: 'all', limit: '100' });
       if (cursor) query.set('starting_after', cursor);
       const page = await this.stripe('subscriptions?' + query);
       if (!Array.isArray(page.data)) throw new Error('Invalid Stripe subscription response');
@@ -90,20 +190,51 @@ export class CustomerBilling {
     const stamp = fields.find(part => part.startsWith('t='))?.slice(2) || '';
     if (!/^\d+$/.test(stamp) || Math.abs(Date.now() / 1000 - Number(stamp)) > 300) return 400;
     const expected = createHmac('sha256', this.secret).update(stamp + '.').update(raw).digest();
-    if (!fields.some(part => /^v1=[a-f0-9]{64}$/i.test(part) && timingSafeEqual(expected, Buffer.from(part.slice(3), 'hex')))) return 400;
+    if (
+      !fields.some(
+        part => /^v1=[a-f0-9]{64}$/i.test(part) && timingSafeEqual(expected, Buffer.from(part.slice(3), 'hex'))
+      )
+    ) {
+      return 400;
+    }
     let event;
-    try { event = JSON.parse(raw.toString('utf8')); } catch { return 400; }
-    if (event?.livemode !== false) return 400;
-    if (!['checkout.session.completed','customer.subscription.created','customer.subscription.updated','customer.subscription.deleted'].includes(event.type)) return 200;
+    try {
+      event = JSON.parse(raw.toString('utf8'));
+    } catch {
+      return 400;
+    }
+    const expectedLivemode = this.livemode;
+    if (event?.livemode !== expectedLivemode) return 400;
+    if (
+      ![
+        'checkout.session.completed',
+        'customer.subscription.created',
+        'customer.subscription.updated',
+        'customer.subscription.deleted',
+      ].includes(event.type)
+    ) {
+      return 200;
+    }
     const customer = event.data?.object?.customer;
     if (typeof customer !== 'string') return 400;
-    const owner = this.db.prepare('SELECT account_id FROM stripe_customer_accounts WHERE stripe_customer_id=?').get(customer);
+    const owner = this.db
+      .prepare('SELECT account_id FROM stripe_customer_accounts WHERE stripe_customer_id=?')
+      .get(customer);
     if (!owner) return 200;
     const subscriptions = await this.subscriptions(customer);
-    const activePrices = new Set(subscriptions.filter(s => s.livemode === false && s.customer === customer && ['active','trialing'].includes(s.status))
-      .flatMap(s => s.items?.data?.map((item: any) => item.price?.id) || []));
+    const activePrices = new Set(
+      subscriptions
+        .filter(
+          s => s.livemode === expectedLivemode && s.customer === customer && ['active', 'trialing'].includes(s.status)
+        )
+        .flatMap(s => s.items?.data?.map((item: any) => item.price?.id) || [])
+    );
     const matching = this.prices.filter(p => p.id && activePrices.has(p.id));
-    const plan = matching.some(p => p.plan === 'academic_tier') ? 'academic_tier' : matching.length ? 'indie_solo' : 'free';
+    const plan = matching.some(p => p.plan === 'academic_tier')
+      ? 'academic_tier'
+      : matching.length
+        ? 'indie_solo'
+        : 'free';
     this.db.prepare('UPDATE customer_accounts SET plan=? WHERE id=?').run(plan, owner.account_id);
     return 200;
   }

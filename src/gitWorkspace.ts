@@ -23,27 +23,64 @@ export class GitWorkspace {
     return directory;
   }
 
-  protected run(directory: string, args: string[]) {
+  private preparedGit(directory: string) {
     const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
     const gitEnv = { ...env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
     // Customer repositories can contain executable checkout filters. Disable every
     // locally configured driver before reading or changing the working tree.
-    const filters = spawnSync('git', ['-C', directory, 'config', '--local', '--includes', '--name-only',
-      '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'], {
-      encoding: 'utf8', env: gitEnv, timeout: 5_000, maxBuffer: 1024 * 1024,
-    });
+    const filters = spawnSync(
+      'git',
+      ['-C', directory, 'config', '--local', '--includes', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
+      {
+        encoding: 'utf8',
+        env: gitEnv,
+        timeout: 5_000,
+        maxBuffer: 1024 * 1024,
+      }
+    );
     if (filters.status !== 0 && filters.status !== 1) throw new Error('Could not inspect Git filter configuration');
     const config = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'submodule.recurse=false'];
     for (const key of filters.stdout.trim().split('\n').filter(Boolean)) {
       const driver = key.match(/^filter\.(.+)\.(clean|smudge|process|required)$/)?.[1];
       if (!driver || !/^[a-zA-Z0-9_-]+$/.test(driver)) throw new Error('Unsupported Git filter driver name');
-      config.push('-c', `filter.${driver}.clean=`, '-c', `filter.${driver}.smudge=`,
-        '-c', `filter.${driver}.process=`, '-c', `filter.${driver}.required=false`);
+      config.push(
+        '-c',
+        `filter.${driver}.clean=`,
+        '-c',
+        `filter.${driver}.smudge=`,
+        '-c',
+        `filter.${driver}.process=`,
+        '-c',
+        `filter.${driver}.required=false`
+      );
     }
+    return { config, gitEnv };
+  }
+
+  protected run(directory: string, args: string[]) {
+    const { config, gitEnv } = this.preparedGit(directory);
     return execFileSync('git', [...config, '-C', directory, ...args], {
-      encoding: 'utf8', timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
-      env: gitEnv, stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      timeout: 20_000,
+      maxBuffer: 2 * 1024 * 1024,
+      env: gitEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
+  }
+
+  archiveZip(relative: string, maxBytes = 25 * 1024 * 1024): { head: string; zip: Buffer } {
+    const directory = this.resolve(relative);
+    const { head } = this.inspect(relative);
+    if (!head) throw new Error('Commit your initial work before creating an archive');
+    const { config, gitEnv } = this.preparedGit(directory);
+    // Export strictly from committed HEAD tree; never reads untracked, ignored, or .git files.
+    const zip = execFileSync('git', [...config, '-C', directory, 'archive', '--format=zip', head], {
+      timeout: 30_000,
+      maxBuffer: maxBytes,
+      env: gitEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { head, zip };
   }
 
   inspect(relative: string) {

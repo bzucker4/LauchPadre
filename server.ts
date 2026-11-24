@@ -1,22 +1,29 @@
+import 'dotenv/config';
 import { CustomerBilling } from './src/customerBilling.ts';
 import { CustomerCheckpoints, CheckpointError } from './src/customerCheckpoints.ts';
-import { repositoryLimitReached } from './src/plans.ts';
+import { CustomerZenodo, ZenodoArchiveError } from './src/customerZenodo.ts';
+import { repositoryLimitReached, type PlanId } from './src/plans.ts';
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// In AI Studio Cloud Run containers, Nginx reverse proxy binds to 8080 and routes to 3000.
-// Node Express dev server must strictly bind to port 3000 (or CLI --port).
+// Priority: CLI --port > process.env.PORT > 3000
 const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 && process.argv[portArgIdx + 1] ? Number(process.argv[portArgIdx + 1]) : null;
-const PORT = cliPort && !isNaN(cliPort) ? cliPort : 3000;
+const envPort = process.env.PORT ? Number(process.env.PORT) : null;
+const PORT =
+  cliPort && Number.isInteger(cliPort) && cliPort > 0
+    ? cliPort
+    : envPort && Number.isInteger(envPort) && envPort > 0
+      ? envPort
+      : 3000;
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -481,24 +488,25 @@ function createInitialStore(): RelationalStore {
   };
 }
 
-const workspacePath = process.env.LAUNCHPADRE_WORKSPACE_DB || path.join(__dirname, 'data', 'workspace-runtime.db');
-fs.mkdirSync(path.dirname(workspacePath), { recursive: true });
-const workspaceDatabase = new DatabaseSync(workspacePath);
-workspaceDatabase.exec(`CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, body TEXT NOT NULL)`);
-const savedWorkspace = workspaceDatabase.prepare('SELECT version, body FROM workspace WHERE id=1').get() as { version: number; body: string } | undefined;
-if (savedWorkspace && savedWorkspace.version !== 1) throw new Error(`Unsupported workspace version ${savedWorkspace.version}`);
-let db: RelationalStore = savedWorkspace ? JSON.parse(savedWorkspace.body) as RelationalStore : createInitialStore();
-function persistWorkspace() {
-  workspaceDatabase.prepare('INSERT INTO workspace (id, version, body) VALUES (1, 1, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(JSON.stringify(db));
+function createEmptyStore(): RelationalStore {
+  return {
+    users: [],
+    repositories: [],
+    tasks: [],
+    commits: [],
+    task_commit_links: [],
+    academic_dois: [],
+    panic_snapshots: [],
+    untracked_slop: [],
+    counters: {
+      userId: 0,
+      repoId: 0,
+      taskId: 0,
+      commitId: 0,
+      doiId: 0,
+    },
+  };
 }
-if (!savedWorkspace) persistWorkspace();
-
-recordLog(
-  'INFO',
-  'ENGINE_BOOT',
-  200,
-  'Initialized LaunchPadre Core Engine: Phases 1, 2 & 3 (Stripe & Zenodo Active)'
-);
 
 // Mutex locks per repository
 const repoExecutionLocks = new Map<number, boolean>();
@@ -552,198 +560,119 @@ function hydrateTask(task: TaskRow, store: RelationalStore) {
 // 4. EXPRESS SERVER SETUP
 // ============================================================================
 
-async function startServer() {
+export interface CreateAppOptions {
+  workspaceDbPath?: string;
+  customerGitRoot?: string;
+  production?: boolean;
+  attachVite?: boolean;
+  billingRequest?: typeof fetch;
+  zenodoRequest?: typeof fetch;
+  zenodoToken?: string;
+  zenodoBaseUrl?: string;
+}
+
+export async function createApp(options: CreateAppOptions = {}) {
+  const workspacePath =
+    options.workspaceDbPath ??
+    (process.env.LAUNCHPADRE_WORKSPACE_DB || path.join(__dirname, 'data', 'workspace-runtime.db'));
+  if (workspacePath !== ':memory:') {
+    fs.mkdirSync(path.dirname(workspacePath), { recursive: true });
+  }
+  const workspaceDatabase = new DatabaseSync(workspacePath);
+  workspaceDatabase.exec('PRAGMA foreign_keys = ON;');
+  if (workspacePath !== ':memory:') {
+    workspaceDatabase.exec('PRAGMA journal_mode = WAL;');
+  }
+  workspaceDatabase.exec('PRAGMA busy_timeout = 5000;');
+  workspaceDatabase.exec(
+    `CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, body TEXT NOT NULL)`
+  );
+
+  const production = options.production ?? process.env.NODE_ENV === 'production';
+  const seedDemo = !production && process.env.LAUNCHPADRE_SEED_DEMO === 'true';
+  const savedWorkspace = workspaceDatabase
+    .prepare('SELECT version, body FROM workspace WHERE id=1')
+    .get() as { version: number; body: string } | undefined;
+  if (savedWorkspace && savedWorkspace.version !== 1) {
+    throw new Error(`Unsupported workspace version ${savedWorkspace.version}`);
+  }
+  let db: RelationalStore = savedWorkspace
+    ? (JSON.parse(savedWorkspace.body) as RelationalStore)
+    : seedDemo
+      ? createInitialStore()
+      : createEmptyStore();
+
+  function persistWorkspace() {
+    workspaceDatabase
+      .prepare('INSERT INTO workspace (id, version, body) VALUES (1, 1, ?) ON CONFLICT(id) DO UPDATE SET body=excluded.body')
+      .run(JSON.stringify(db));
+  }
+  if (!savedWorkspace) persistWorkspace();
+
+  recordLog(
+    'INFO',
+    'ENGINE_BOOT',
+    200,
+    `Initialized LaunchPadre Core Engine (${production ? 'production' : 'development'})`
+  );
+
   const app = express();
+  const trustProxy = process.env.TRUST_PROXY;
+  if (trustProxy === 'true') {
+    app.set('trust proxy', 1);
+  } else if (trustProxy && /^\d+$/.test(trustProxy)) {
+    app.set('trust proxy', Number(trustProxy));
+  }
+
   const customerAuth = new CustomerAuth(workspaceDatabase);
-  const customerBilling = new CustomerBilling(workspaceDatabase);
+  const customerBilling = new CustomerBilling(workspaceDatabase, options.billingRequest);
   app.disable('x-powered-by');
-  const production = process.env.NODE_ENV === 'production';
   const accessToken = process.env.LAUNCHPADRE_ACCESS_TOKEN;
   const sessionSecret = process.env.WEBHOOK_SECRET || '';
-  const sessionSignature = () => crypto.createHmac('sha256', sessionSecret).update('launchpadre-admin-session-v1').digest('hex');
-  if (production && (!accessToken || accessToken.length < 32 || !process.env.WEBHOOK_SECRET || process.env.WEBHOOK_SECRET.length < 32)) {
+  const sessionSignature = () =>
+    crypto.createHmac('sha256', sessionSecret).update('launchpadre-admin-session-v1').digest('hex');
+  if (
+    production &&
+    (!accessToken || accessToken.length < 32 || !process.env.WEBHOOK_SECRET || process.env.WEBHOOK_SECRET.length < 32)
+  ) {
+    workspaceDatabase.close();
     throw new Error('Production requires LAUNCHPADRE_ACCESS_TOKEN and WEBHOOK_SECRET (32+ characters each)');
   }
-  app.get('/healthz', (_req: Request, res: Response) => res.json({ status: 'ok' }));
-  app.use((_req: Request, res: Response, next: NextFunction) => {
-    res.setHeader('Cache-Control', 'no-store');
+
+  // Health probe & robots.txt (always reachable by load balancers and crawlers)
+  app.get('/healthz', (_req: Request, res: Response) => {
+    try {
+      workspaceDatabase.prepare('SELECT 1').get();
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ status: 'ok', version: '1.0.0' });
+    } catch {
+      res.status(503).json({ status: 'error' });
+    }
+  });
+
+  // Layer A: robots.txt
+  app.get('/robots.txt', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(DYNAMIC_ROBOTS_TXT_CONTENT);
+  });
+
+  // Global security headers
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/auth/')) {
+      res.setHeader('Cache-Control', 'no-store');
+    }
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('X-Frame-Options', 'DENY');
-    next();
-  });
-  const customerCookie = (req: Request) => req.header('cookie')?.match(/(?:^|;\s*)lp_customer=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
-  const customerCookieOptions = `HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production ? '; Secure' : ''}`;
-  const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
-  const authThrottle = (req: Request, res: Response, next: NextFunction) => {
-    const key = req.ip || 'unknown';
-    const now = Date.now();
-    const prior = registrationAttempts.get(key);
-    const entry = prior && prior.resetAt > now ? prior : { count: 0, resetAt: now + 15 * 60_000 };
-    entry.count += 1;
-    registrationAttempts.set(key, entry);
-    if (entry.count > 20) { res.status(429).json({ error: 'Too many attempts' }); return; }
-    next();
-  };
-  app.post('/api/customer/register', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
-    try {
-      const email = req.body?.email;
-      const password = req.body?.password;
-      if (typeof email !== 'string' || typeof password !== 'string') { res.status(400).json({ error: 'Invalid credentials' }); return; }
-      const account = customerAuth.register(email, password);
-      res.status(201).json(account);
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('UNIQUE constraint')) { res.status(409).json({ error: 'Account already exists' }); return; }
-      res.status(400).json({ error: 'Registration failed or credentials invalid' });
-    }
-  });
-  app.post('/api/customer/login', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
-    const email = req.body?.email;
-    const password = req.body?.password;
-    if (typeof email !== 'string' || typeof password !== 'string' || password.length > 1024) { res.status(400).json({ error: 'Invalid credentials' }); return; }
-    const login = customerAuth.login(email, password);
-    if (!login) { res.status(401).json({ error: 'Invalid credentials' }); return; }
-    res.setHeader('Set-Cookie', `lp_customer=${login.token}; ${customerCookieOptions}`);
-    res.json({ status: 'authenticated' });
-  });
-  app.get('/api/customer/me', (req: Request, res: Response) => {
-    const customer = customerAuth.session(customerCookie(req));
-    if (!customer) { res.status(401).json({ error: 'Unauthorized' }); return; }
-    res.json(customer);
-  });
-  // Customer-scoped data is intentionally separate from legacy demonstration state.
-  workspaceDatabase.exec(`CREATE TABLE IF NOT EXISTS customer_repositories (
-    id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
-    name TEXT NOT NULL, created_at TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_customer_repositories_owner ON customer_repositories(customer_id);
-  CREATE TABLE IF NOT EXISTS customer_tasks (
-    id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES customer_repositories(id) ON DELETE CASCADE,
-    title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','done')),
-    created_at TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_customer_tasks_repo ON customer_tasks(repository_id);`);
-  const requireCustomer = (req: Request, res: Response, next: NextFunction) => {
-    const customer = customerAuth.session(customerCookie(req));
-    if (!customer) { res.status(401).json({ error: 'Unauthorized' }); return; }
-    res.locals.customer = customer;
-    next();
-  };
-  const checkpoints = new CustomerCheckpoints(workspaceDatabase, process.env.LAUNCHPADRE_CUSTOMER_GIT_ROOT);
-  function checkpointResponse(res: Response, action: () => unknown, status = 200) {
-    try { res.status(status).json(action()); }
-    catch (error) {
-      if (error instanceof CheckpointError) { res.status(error.status).json({ error: error.message }); return; }
-      const message = error instanceof Error && !('code' in error) && !('status' in error)
-        ? error.message : 'Git operation failed. Verify the repository path and Git state with your workspace operator.';
-      res.status(409).json({ error: message });
-    }
-  }
-  app.get('/api/customer/repositories/:id/checkpoints', requireCustomer, (req, res) => {
-    checkpointResponse(res, () => checkpoints.info(res.locals.customer, String(req.params.id)));
-  });
-  app.put('/api/customer/repositories/:id/git', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
-    checkpointResponse(res, () => checkpoints.bind(res.locals.customer, String(req.params.id), req.body?.relative_path));
-  });
-  app.post('/api/customer/repositories/:id/checkpoints', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
-    checkpointResponse(res, () => checkpoints.create(res.locals.customer, String(req.params.id), req.body?.name), 201);
-  });
-  app.post('/api/customer/repositories/:id/restore', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
-    checkpointResponse(res, () => checkpoints.rollback(res.locals.customer, String(req.params.id), req.body || {}));
-  });
-  app.get('/api/customer/billing/offers', requireCustomer, (_req, res) => {
-    res.json({ plan: res.locals.customer.plan, offers: customerBilling.offers() });
-  });
-  app.post('/api/customer/billing/checkout', express.json({ limit: '4kb' }), requireCustomer, async (req, res) => {
-    const { plan, interval } = req.body || {};
-    if (!customerBilling.offers().some(offer => offer.plan === plan && offer.interval === interval)) {
-      res.status(503).json({ error: 'This test checkout is unavailable' });
-      return;
-    }
-    try {
-      res.json(await customerBilling.checkout(res.locals.customer, plan, interval));
-    } catch {
-      res.status(502).json({ error: 'Checkout could not start. Check Stripe configuration or manage an existing subscription.' });
-    }
-  });
-  app.get('/api/customer/repositories', requireCustomer, (_req: Request, res: Response) => {
-    res.json(workspaceDatabase.prepare('SELECT id,name,created_at FROM customer_repositories WHERE customer_id=? ORDER BY created_at DESC').all(res.locals.customer.id));
-  });
-  app.post('/api/customer/repositories', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
-    const name = req.body?.name;
-    if (typeof name !== 'string' || !name.trim() || name.length > 120) { res.status(400).json({ error: 'Invalid repository name' }); return; }
-    const count = workspaceDatabase.prepare('SELECT COUNT(*) AS total FROM customer_repositories WHERE customer_id=?').get(res.locals.customer.id);
-    if (repositoryLimitReached(res.locals.customer.plan, Number(count?.total))) {
-      res.status(402).json({ error: 'Your plan allows three repositories' });
-      return;
-    }
-    const id = crypto.randomUUID();
-    workspaceDatabase.prepare('INSERT INTO customer_repositories (id,customer_id,name,created_at) VALUES (?,?,?,?)').run(id,res.locals.customer.id,name.trim(),new Date().toISOString());
-    res.status(201).json({ id, name: name.trim() });
-  });
-  app.get('/api/customer/repositories/:id/tasks', requireCustomer, (req: Request, res: Response) => {
-    const repo = workspaceDatabase.prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?').get(req.params.id,res.locals.customer.id);
-    if (!repo) { res.status(404).json({ error: 'Repository not found' }); return; }
-    res.json(workspaceDatabase.prepare('SELECT id,title,status,created_at FROM customer_tasks WHERE repository_id=? ORDER BY created_at DESC').all(req.params.id));
-  });
-  app.post('/api/customer/repositories/:id/tasks', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
-    const repo = workspaceDatabase.prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?').get(req.params.id,res.locals.customer.id);
-    if (!repo) { res.status(404).json({ error: 'Repository not found' }); return; }
-    const title = req.body?.title;
-    if (typeof title !== 'string' || !title.trim() || title.length > 250) { res.status(400).json({ error: 'Invalid task title' }); return; }
-    const id = crypto.randomUUID();
-    workspaceDatabase.prepare('INSERT INTO customer_tasks (id,repository_id,title,created_at) VALUES (?,?,?,?)').run(id,req.params.id,title.trim(),new Date().toISOString());
-    res.status(201).json({ id, title: title.trim(), status: 'todo' });
-  });
-  app.patch('/api/customer/tasks/:id', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
-    const status = req.body?.status;
-    if (!['todo','in_progress','done'].includes(status)) { res.status(400).json({ error: 'Invalid status' }); return; }
-    const updated = workspaceDatabase.prepare(`UPDATE customer_tasks SET status=? WHERE id=? AND repository_id IN
-      (SELECT id FROM customer_repositories WHERE customer_id=?)`).run(status,req.params.id,res.locals.customer.id);
-    if (!updated.changes) { res.status(404).json({ error: 'Task not found' }); return; }
-    res.json({ id: req.params.id, status });
-  });
-  app.post('/api/customer/logout', (req: Request, res: Response) => {
-    const token = customerCookie(req);
-    if (token) customerAuth.logout(token);
-    res.setHeader('Set-Cookie', `lp_customer=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production ? '; Secure' : ''}`);
-    res.json({ status: 'logged_out' });
-  });
-  app.post('/auth/login', express.json({ limit: '4kb' }), (req: Request, res: Response) => {
-    const supplied = typeof req.body?.token === 'string' ? req.body.token : '';
-    if (!accessToken || supplied.length !== accessToken.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))) {
-      res.status(401).json({ error: 'Invalid access token' }); return;
-    }
-    res.setHeader('Set-Cookie', `lp_session=${sessionSignature()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production ? '; Secure' : ''}`);
-    res.json({ status: 'authenticated' });
-  });
-  app.post('/auth/logout', (_req: Request, res: Response) => {
-    res.setHeader('Set-Cookie', 'lp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
-    res.json({ status: 'logged_out' });
-  });
-  app.get('/auth/session', (req: Request, res: Response) => {
-    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
-    const expected = sessionSignature();
-    res.json({ authenticated: Boolean(accessToken && cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))) });
-  });
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    if (!production || req.path === '/healthz' || req.path === '/robots.txt' || req.path === '/' || req.path.startsWith('/assets/')) return next();
-    if (req.path.startsWith('/api/customer/')) return next();
-    if (req.path === '/api/v1/webhooks/git-core' || req.path === '/api/v1/billing/webhooks/stripe') return next();
-    if (!req.path.startsWith('/api/')) return next();
-    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
-    const expected = sessionSignature();
-    if (cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))) {
-      if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.header('origin') && req.header('origin') !== `${req.protocol}://${req.get('host')}`) { res.status(403).json({ error: 'Origin mismatch' }); return; }
-      return next();
-    }
-    const supplied = req.header('Authorization')?.replace(/^Bearer\s+/i, '') || '';
-    if (!accessToken || supplied.length !== accessToken.length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))) {
-      res.status(401).json({ error: 'Unauthorized' }); return;
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (production) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
     next();
   });
 
-  // Layer B & Layer C Data Sovereignty Middleware
+  // Layer B Data Sovereignty Middleware: block known AI training scrapers across app & API
   app.use((req: Request, res: Response, next: NextFunction) => {
     const userAgent = (req.header('user-agent') || '').toLowerCase().trim();
     if (userAgent) {
@@ -760,14 +689,516 @@ async function startServer() {
             client_ip: clientIp,
             path: req.path,
           });
-          res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+          if (scraperProbeRecords.length > 200) scraperProbeRecords.pop();
           res.status(403).type('text/plain').send(`403 Forbidden: AI scrapers blocked by LaunchPadre. Matched: ${sig}\n`);
           return;
         }
       }
     }
-    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+  });
+
+  // Customer cookie uses SameSite=Lax so Stripe top-level GET returns preserve the session,
+  // paired with strict same-origin CSRF verification on every mutating customer request.
+  const customerCookie = (req: Request) =>
+    req.header('cookie')?.match(/(?:^|;\s*)lp_customer=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+  const customerCookieOptions = `HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${production ? '; Secure' : ''}`;
+
+  const verifySameOrigin = (req: Request, res: Response, next: NextFunction) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    const fetchSite = req.header('sec-fetch-site');
+    if (fetchSite === 'cross-site') {
+      res.status(403).json({ error: 'Cross-site request blocked' });
+      return;
+    }
+    const origin = req.header('origin');
+    const host = req.get('host');
+    if (origin && host && origin !== `${req.protocol}://${host}`) {
+      res.status(403).json({ error: 'Origin mismatch' });
+      return;
+    }
+    next();
+  };
+
+  const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
+  const authThrottle = (req: Request, res: Response, next: NextFunction) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    if (registrationAttempts.size > 1000) {
+      for (const [k, v] of registrationAttempts) {
+        if (v.resetAt <= now) registrationAttempts.delete(k);
+      }
+    }
+    const prior = registrationAttempts.get(key);
+    const entry = prior && prior.resetAt > now ? prior : { count: 0, resetAt: now + 15 * 60_000 };
+    entry.count += 1;
+    registrationAttempts.set(key, entry);
+    if (entry.count > 20) {
+      res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+      return;
+    }
+    next();
+  };
+
+  app.use('/api/customer', verifySameOrigin);
+
+  app.post('/api/customer/register', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    try {
+      const email = req.body?.email;
+      const password = req.body?.password;
+      if (typeof email !== 'string' || typeof password !== 'string') {
+        res.status(400).json({ error: 'Email and password are required' });
+        return;
+      }
+      const account = customerAuth.register(email, password);
+      res.status(201).json(account);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('UNIQUE constraint')) {
+        res.status(409).json({ error: 'Account already exists' });
+        return;
+      }
+      const message =
+        error instanceof Error &&
+        (error.message.includes('email') || error.message.includes('Password'))
+          ? error.message
+          : 'Registration failed or credentials invalid';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/customer/login', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    const password = req.body?.password;
+    if (typeof email !== 'string' || typeof password !== 'string' || password.length > 1024) {
+      res.status(400).json({ error: 'Invalid credentials' });
+      return;
+    }
+    const login = customerAuth.login(email, password);
+    if (!login) {
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+    res.setHeader('Set-Cookie', `lp_customer=${login.token}; ${customerCookieOptions}`);
+    res.json({ status: 'authenticated' });
+  });
+
+  app.get('/api/customer/me', (req: Request, res: Response) => {
+    const customer = customerAuth.session(customerCookie(req));
+    if (!customer) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    res.json(customer);
+  });
+
+  // Customer-scoped data is intentionally separate from legacy demonstration state.
+  workspaceDatabase.exec(`CREATE TABLE IF NOT EXISTS customer_repositories (
+    id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customer_accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_customer_repositories_owner ON customer_repositories(customer_id);
+  CREATE TABLE IF NOT EXISTS customer_tasks (
+    id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES customer_repositories(id) ON DELETE CASCADE,
+    title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','done')),
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_customer_tasks_repo ON customer_tasks(repository_id);`);
+
+  const requireCustomer = (req: Request, res: Response, next: NextFunction) => {
+    const customer = customerAuth.session(customerCookie(req));
+    if (!customer) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    res.locals.customer = customer;
+    next();
+  };
+
+  const checkpoints = new CustomerCheckpoints(
+    workspaceDatabase,
+    options.customerGitRoot ?? process.env.LAUNCHPADRE_CUSTOMER_GIT_ROOT
+  );
+  const zenodo = new CustomerZenodo(workspaceDatabase, checkpoints, options.zenodoRequest, {
+    token: options.zenodoToken,
+    baseUrl: options.zenodoBaseUrl,
+  });
+
+  function checkpointResponse(res: Response, action: () => unknown, status = 200) {
+    try {
+      res.status(status).json(action());
+    } catch (error) {
+      if (error instanceof CheckpointError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      const message =
+        error instanceof Error && !('code' in error) && !('status' in error)
+          ? error.message
+          : 'Git operation failed. Verify the repository path and Git state with your workspace operator.';
+      res.status(409).json({ error: message });
+    }
+  }
+
+  async function zenodoResponse(res: Response, action: () => Promise<unknown> | unknown, status = 200) {
+    try {
+      res.status(status).json(await action());
+    } catch (error) {
+      if (error instanceof ZenodoArchiveError || error instanceof CheckpointError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      const message =
+        error instanceof Error && !('code' in error) && !('status' in error)
+          ? error.message
+          : 'Zenodo operation failed.';
+      res.status(502).json({ error: message });
+    }
+  }
+
+  app.post('/api/customer/password', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const currentPassword = req.body?.current_password;
+    const newPassword = req.body?.new_password;
+    if (
+      typeof currentPassword !== 'string' ||
+      typeof newPassword !== 'string' ||
+      currentPassword.length > 1024 ||
+      newPassword.length > 1024
+    ) {
+      res.status(400).json({ error: 'Current and new passwords are required' });
+      return;
+    }
+    try {
+      const updated = customerAuth.changePassword(
+        res.locals.customer.id,
+        currentPassword,
+        newPassword,
+        customerCookie(req)
+      );
+      if (!updated) {
+        res.status(401).json({ error: 'Current password is incorrect' });
+        return;
+      }
+      res.json({ status: 'password_updated' });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Unable to update password' });
+    }
+  });
+
+  app.get('/api/customer/repositories/:id/checkpoints', requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.info(res.locals.customer, String(req.params.id)));
+  });
+  app.put('/api/customer/repositories/:id/git', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.bind(res.locals.customer, String(req.params.id), req.body?.relative_path));
+  });
+  app.post('/api/customer/repositories/:id/checkpoints', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.create(res.locals.customer, String(req.params.id), req.body?.name), 201);
+  });
+  app.post('/api/customer/repositories/:id/restore', express.json({ limit: '4kb' }), requireCustomer, (req, res) => {
+    checkpointResponse(res, () => checkpoints.rollback(res.locals.customer, String(req.params.id), req.body || {}));
+  });
+
+  app.get('/api/customer/repositories/:id/zenodo', requireCustomer, (req, res) => {
+    void zenodoResponse(res, () => zenodo.list(res.locals.customer, String(req.params.id)));
+  });
+  app.post('/api/customer/repositories/:id/zenodo/drafts', express.json({ limit: '16kb' }), requireCustomer, (req, res) => {
+    void zenodoResponse(
+      res,
+      () => zenodo.createDraft(res.locals.customer, String(req.params.id), req.body || {}),
+      201
+    );
+  });
+  app.post(
+    '/api/customer/repositories/:id/zenodo/drafts/:archiveId/publish',
+    express.json({ limit: '4kb' }),
+    requireCustomer,
+    (req, res) => {
+      void zenodoResponse(res, () =>
+        zenodo.publishDraft(
+          res.locals.customer,
+          String(req.params.id),
+          String(req.params.archiveId),
+          req.body?.confirm
+        )
+      );
+    }
+  );
+
+  app.get('/api/customer/billing/offers', requireCustomer, (_req, res) => {
+    res.json({
+      plan: res.locals.customer.plan,
+      mode: customerBilling.mode(),
+      has_portal: customerBilling.hasBillingAccount(res.locals.customer.id),
+      offers: customerBilling.offers(),
+    });
+  });
+  app.post('/api/customer/billing/checkout', express.json({ limit: '4kb' }), requireCustomer, async (req, res) => {
+    const { plan, interval } = req.body || {};
+    if (!customerBilling.offers().some(offer => offer.plan === plan && offer.interval === interval)) {
+      res.status(503).json({ error: 'This checkout option is unavailable' });
+      return;
+    }
+    try {
+      res.json(await customerBilling.checkout(res.locals.customer, plan, interval));
+    } catch {
+      res
+        .status(502)
+        .json({ error: 'Checkout could not start. Check Stripe configuration or manage an existing subscription.' });
+    }
+  });
+  app.post('/api/customer/billing/portal', requireCustomer, async (_req, res) => {
+    try {
+      res.json(await customerBilling.portal(res.locals.customer));
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message.includes('billing profile')
+          ? error.message
+          : 'Billing portal could not open. Check Stripe Customer Portal configuration.';
+      res.status(502).json({ error: message });
+    }
+  });
+
+  app.get('/api/customer/repositories', requireCustomer, (_req: Request, res: Response) => {
+    const rows = workspaceDatabase
+      .prepare(
+        `SELECT r.id, r.name, r.created_at, b.relative_path AS git_path,
+                (SELECT COUNT(*) FROM customer_tasks t WHERE t.repository_id = r.id) AS task_count
+         FROM customer_repositories r
+         LEFT JOIN customer_git_bindings b ON b.repository_id = r.id
+         WHERE r.customer_id=?
+         ORDER BY r.created_at DESC`
+      )
+      .all(res.locals.customer.id);
+    res.json(rows);
+  });
+
+  app.post('/api/customer/repositories', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const name = req.body?.name;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120) {
+      res.status(400).json({ error: 'Enter a repository name between 1 and 120 characters' });
+      return;
+    }
+    workspaceDatabase.exec('BEGIN IMMEDIATE');
+    try {
+      const account = workspaceDatabase
+        .prepare('SELECT plan FROM customer_accounts WHERE id=?')
+        .get(res.locals.customer.id) as { plan: PlanId } | undefined;
+      const count = workspaceDatabase
+        .prepare('SELECT COUNT(*) AS total FROM customer_repositories WHERE customer_id=?')
+        .get(res.locals.customer.id) as { total: number } | undefined;
+      if (repositoryLimitReached(account?.plan ?? 'free', Number(count?.total))) {
+        workspaceDatabase.exec('ROLLBACK');
+        res.status(402).json({ error: 'Free Developer allows up to three repositories. Delete one or upgrade your plan.' });
+        return;
+      }
+      const id = crypto.randomUUID();
+      const trimmed = name.trim();
+      const createdAt = new Date().toISOString();
+      workspaceDatabase
+        .prepare('INSERT INTO customer_repositories (id,customer_id,name,created_at) VALUES (?,?,?,?)')
+        .run(id, res.locals.customer.id, trimmed, createdAt);
+      workspaceDatabase.exec('COMMIT');
+      res.status(201).json({ id, name: trimmed, created_at: createdAt });
+    } catch (error) {
+      try {
+        workspaceDatabase.exec('ROLLBACK');
+      } catch {}
+      throw error;
+    }
+  });
+
+  app.patch('/api/customer/repositories/:id', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const name = req.body?.name;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120) {
+      res.status(400).json({ error: 'Enter a repository name between 1 and 120 characters' });
+      return;
+    }
+    const trimmed = name.trim();
+    const updated = workspaceDatabase
+      .prepare('UPDATE customer_repositories SET name=? WHERE id=? AND customer_id=?')
+      .run(trimmed, req.params.id, res.locals.customer.id);
+    if (!updated.changes) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    res.json({ id: req.params.id, name: trimmed });
+  });
+
+  app.delete('/api/customer/repositories/:id', requireCustomer, (req: Request, res: Response) => {
+    const deleted = workspaceDatabase
+      .prepare('DELETE FROM customer_repositories WHERE id=? AND customer_id=?')
+      .run(req.params.id, res.locals.customer.id);
+    if (!deleted.changes) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    res.json({ status: 'deleted', id: req.params.id });
+  });
+
+  app.get('/api/customer/repositories/:id/tasks', requireCustomer, (req: Request, res: Response) => {
+    const repo = workspaceDatabase
+      .prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?')
+      .get(req.params.id, res.locals.customer.id);
+    if (!repo) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    res.json(
+      workspaceDatabase
+        .prepare('SELECT id,title,status,created_at FROM customer_tasks WHERE repository_id=? ORDER BY created_at DESC')
+        .all(req.params.id)
+    );
+  });
+
+  app.post('/api/customer/repositories/:id/tasks', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const repo = workspaceDatabase
+      .prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?')
+      .get(req.params.id, res.locals.customer.id);
+    if (!repo) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    const title = req.body?.title;
+    if (typeof title !== 'string' || !title.trim() || title.trim().length > 250) {
+      res.status(400).json({ error: 'Enter a task title between 1 and 250 characters' });
+      return;
+    }
+    const id = crypto.randomUUID();
+    const trimmed = title.trim();
+    const createdAt = new Date().toISOString();
+    workspaceDatabase
+      .prepare('INSERT INTO customer_tasks (id,repository_id,title,created_at) VALUES (?,?,?,?)')
+      .run(id, req.params.id, trimmed, createdAt);
+    res.status(201).json({ id, title: trimmed, status: 'todo', created_at: createdAt });
+  });
+
+  app.patch('/api/customer/tasks/:id', express.json({ limit: '4kb' }), requireCustomer, (req: Request, res: Response) => {
+    const hasStatus = req.body?.status !== undefined;
+    const hasTitle = req.body?.title !== undefined;
+    if (!hasStatus && !hasTitle) {
+      res.status(400).json({ error: 'Provide status or title to update' });
+      return;
+    }
+    const status = req.body?.status;
+    if (hasStatus && !['todo', 'in_progress', 'done'].includes(status)) {
+      res.status(400).json({ error: 'Invalid status' });
+      return;
+    }
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (hasTitle && (!title || title.length > 250)) {
+      res.status(400).json({ error: 'Enter a task title between 1 and 250 characters' });
+      return;
+    }
+    const existing = workspaceDatabase
+      .prepare(
+        `SELECT t.id, t.title, t.status FROM customer_tasks t
+         JOIN customer_repositories r ON r.id = t.repository_id
+         WHERE t.id=? AND r.customer_id=?`
+      )
+      .get(req.params.id, res.locals.customer.id) as { id: string; title: string; status: string } | undefined;
+    if (!existing) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+    const nextStatus = hasStatus ? status : existing.status;
+    const nextTitle = hasTitle ? title : existing.title;
+    workspaceDatabase
+      .prepare('UPDATE customer_tasks SET status=?, title=? WHERE id=?')
+      .run(nextStatus, nextTitle, existing.id);
+    res.json({ id: existing.id, title: nextTitle, status: nextStatus });
+  });
+
+  app.delete('/api/customer/tasks/:id', requireCustomer, (req: Request, res: Response) => {
+    const deleted = workspaceDatabase
+      .prepare(
+        `DELETE FROM customer_tasks WHERE id=? AND repository_id IN
+         (SELECT id FROM customer_repositories WHERE customer_id=?)`
+      )
+      .run(req.params.id, res.locals.customer.id);
+    if (!deleted.changes) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+    res.json({ status: 'deleted', id: req.params.id });
+  });
+
+  app.post('/api/customer/logout', (req: Request, res: Response) => {
+    const token = customerCookie(req);
+    if (token) customerAuth.logout(token);
+    res.setHeader(
+      'Set-Cookie',
+      `lp_customer=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${production ? '; Secure' : ''}`
+    );
+    res.json({ status: 'logged_out' });
+  });
+
+  app.post('/auth/login', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const supplied = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (
+      !accessToken ||
+      supplied.length !== accessToken.length ||
+      !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))
+    ) {
+      res.status(401).json({ error: 'Invalid access token' });
+      return;
+    }
+    res.setHeader(
+      'Set-Cookie',
+      `lp_session=${sessionSignature()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${production ? '; Secure' : ''}`
+    );
+    res.json({ status: 'authenticated' });
+  });
+  app.post('/auth/logout', (_req: Request, res: Response) => {
+    res.setHeader(
+      'Set-Cookie',
+      `lp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${production ? '; Secure' : ''}`
+    );
+    res.json({ status: 'logged_out' });
+  });
+  app.get('/auth/session', (req: Request, res: Response) => {
+    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+    const expected = sessionSignature();
+    res.json({
+      authenticated: Boolean(
+        accessToken && cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))
+      ),
+    });
+  });
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (
+      !production ||
+      req.path === '/healthz' ||
+      req.path === '/robots.txt' ||
+      req.path === '/' ||
+      req.path.startsWith('/assets/')
+    ) {
+      return next();
+    }
+    if (req.path.startsWith('/api/customer/')) return next();
+    if (req.path === '/api/v1/webhooks/git-core' || req.path === '/api/v1/billing/webhooks/stripe') return next();
+    if (!req.path.startsWith('/api/')) return next();
+    const cookie = req.header('cookie')?.match(/(?:^|;\s*)lp_session=([a-f0-9]{64})(?:;|$)/)?.[1] || '';
+    const expected = sessionSignature();
+    if (cookie.length === expected.length && crypto.timingSafeEqual(Buffer.from(cookie), Buffer.from(expected))) {
+      if (
+        !['GET', 'HEAD', 'OPTIONS'].includes(req.method) &&
+        req.header('origin') &&
+        req.header('origin') !== `${req.protocol}://${req.get('host')}`
+      ) {
+        res.status(403).json({ error: 'Origin mismatch' });
+        return;
+      }
+      return next();
+    }
+    const supplied = req.header('Authorization')?.replace(/^Bearer\s+/i, '') || '';
+    if (
+      !accessToken ||
+      supplied.length !== accessToken.length ||
+      !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(accessToken))
+    ) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
     next();
   });
 
@@ -775,22 +1206,20 @@ async function startServer() {
   app.use('/api/v1/webhooks/git-core', express.raw({ type: '*/*', limit: '5mb' }));
   app.use('/api/v1/billing/webhooks/stripe', express.raw({ type: '*/*', limit: '2mb' }));
   app.use(express.json({ limit: '5mb' }));
-  // Persist successful state-changing requests to the isolated runtime database.
+  // Persist successful legacy /api/v1/ mutations to the workspace store.
   app.use((req: Request, res: Response, next: NextFunction) => {
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    if (req.path.startsWith('/api/v1/') && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
       res.on('finish', () => {
         if (res.statusCode < 400) {
-          try { persistWorkspace(); } catch (error) { console.error('Workspace persistence failed:', error); }
+          try {
+            persistWorkspace();
+          } catch (error) {
+            console.error('Workspace persistence failed:', error);
+          }
         }
       });
     }
     next();
-  });
-
-  // Layer A: robots.txt
-  app.get('/robots.txt', (_req: Request, res: Response) => {
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.send(DYNAMIC_ROBOTS_TXT_CONTENT);
   });
 
   // ==========================================================================
@@ -1288,32 +1717,97 @@ async function startServer() {
     res.json({ status: 'reset' });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+  // Unknown API/auth routes always return JSON 404 instead of SPA HTML
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+  app.all('/auth/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
+  let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+  const shouldAttachVite = options.attachVite ?? !production;
+
+  if (shouldAttachVite) {
+    viteServer = await createViteServer({
       server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use(viteServer.middlewares);
     app.use('*', async (req: Request, res: Response, next: NextFunction) => {
       const url = req.originalUrl;
       try {
         const indexPath = path.resolve(__dirname, 'index.html');
         let template = await fs.promises.readFile(indexPath, 'utf-8');
-        template = await vite.transformIndexHtml(url, template);
+        template = await viteServer!.transformIndexHtml(url, template);
         res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
       } catch (e) {
         next(e);
       }
     });
-  } else {
+  } else if (production) {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { maxAge: '1h', index: false }));
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LaunchPadre Phase 2 Engine listening on port ${PORT}`);
+  // Centralized Express error handler (malformed JSON, payload limits, unexpected faults)
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    if (err?.type === 'entity.too.large') {
+      res.status(413).json({ error: 'Request payload too large' });
+      return;
+    }
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(400).json({ error: 'Invalid JSON body' });
+      return;
+    }
+    console.error('Unhandled server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   });
+
+  async function close() {
+    if (viteServer) {
+      await viteServer.close();
+      viteServer = null;
+    }
+    workspaceDatabase.close();
+  }
+
+  return { app, database: workspaceDatabase, close };
 }
 
-startServer();
+async function startServer() {
+  const { app, close } = await createApp();
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`LaunchPadre Server listening on http://0.0.0.0:${PORT} (${process.env.NODE_ENV || 'development'})`);
+  });
+
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, shutting down LaunchPadre cleanly...`);
+    server.close(async () => {
+      try {
+        await close();
+      } catch (error) {
+        console.error('Error closing resources:', error);
+      }
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+const isDirectEntry =
+  Boolean(process.argv[1]) && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (isDirectEntry) {
+  startServer().catch((error) => {
+    console.error('Failed to start LaunchPadre:', error);
+    process.exit(1);
+  });
+}
