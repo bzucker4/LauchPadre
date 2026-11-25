@@ -14,6 +14,25 @@ function git(directory: string, ...args: string[]) {
   }).trim();
 }
 
+const sentMail: { to: string; text: string }[] = [];
+const capturingMailer = {
+  async send(mail: { to: string; subject: string; text: string }) {
+    sentMail.push({ to: mail.to, text: mail.text });
+  },
+};
+
+async function verifyLatestEmail(base: string, to: string) {
+  const mail = [...sentMail].reverse().find((m) => m.to === to);
+  const token = mail?.text.match(/\?verify=([a-f0-9]{64})/)?.[1];
+  assert.ok(token, `verification email for ${to}`);
+  const response = await fetch(`${base}/api/customer/verify-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal(response.status, 200);
+}
+
 test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password rotation, and checkpoints', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'launchpadre-http-'));
   const dbPath = path.join(tempRoot, 'workspace.db');
@@ -25,6 +44,8 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     customerGitRoot: gitRoot,
     production: false,
     attachVite: false,
+    mailer: capturingMailer,
+    publicOrigin: 'https://app.example.test',
   });
 
   const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
@@ -80,6 +101,16 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
       body: JSON.stringify({ email: 'ALICE@example.com', password: 'correct-horse-battery' }),
     });
     assert.equal(dupA.status, 409);
+
+    // Unverified accounts cannot sign in until the emailed link is used
+    const blockedLogin = await fetch(`${base}/api/customer/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery' }),
+    });
+    assert.equal(blockedLogin.status, 403);
+    assert.equal((await blockedLogin.json()).code, 'email_unverified');
+    await verifyLatestEmail(base, 'alice@example.com');
 
     const loginA = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
@@ -188,6 +219,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'bob@example.com', password: 'bob-password-1234' }),
     });
+    await verifyLatestEmail(base, 'bob@example.com');
     const loginB = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

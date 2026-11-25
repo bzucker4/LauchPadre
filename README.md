@@ -5,6 +5,7 @@ LaunchPadre is a multi-tenant developer workspace built with Express, React, Vit
 ## Features
 
 - **Isolated customer workspaces**: Salted `scrypt` password authentication, `HttpOnly; SameSite=Lax` cookie sessions with CSRF `Origin` / `Sec-Fetch-Site` enforcement, password rotation that revokes other active sessions, and per-customer SQLite data isolation with foreign-key cascading.
+- **Email verification & password reset**: New accounts must verify their email before signing in (accounts created before this feature are grandfathered as verified). Single-use, hashed tokens (verification 24h, reset 1h) are sent through Resend; links use the configured `PUBLIC_ORIGIN`, never the request Host header. Reset and resend endpoints answer identically whether or not an account exists, and completing a reset signs out every session.
 - **Guarded Git checkpoints & restore** ([`docs/customer-checkpoints.md`](docs/customer-checkpoints.md)): Operator-provisioned tenant directories (`<LAUNCHPADRE_CUSTOMER_GIT_ROOT>/<customer ID>/<repo>`), path-traversal/symlink/worktree rejection, disabled Git hooks/filters/fsmonitor, immutable `panic_room_launchpadre_<name>` tags, clean-worktree enforcement (including untracked & ignored files), and automatic `refs/launchpadre/recovery/<UUID>` creation before resetting HEAD.
 - **Stripe billing (test & live)**: Server-verified USD Price catalog (`Indie Solo` \$5/mo or \$39/yr; `Academic Researcher` \$9/mo or \$69/yr), strict test vs live mode matching across prices/webhooks/subscriptions, raw-body HMAC webhook reconciliation, and Stripe Billing Portal self-service management.
 - **Academic DOI archival (Zenodo)**: Available on the `Academic Researcher` plan. Packages committed `HEAD` via hardened `git archive --format=zip` (never includes `.git` or untracked files), uploads a draft deposition to Zenodo Sandbox or Production, and mints a permanent DOI with Markdown badge only after explicit confirmation.
@@ -40,6 +41,7 @@ The test suite (`tests/*.test.ts`) exercises:
 - Real temporary Git repositories, tenant isolation, symlink/traversal rejection, disabled Git filters, recovery refs, and restart persistence (`tests/customerCheckpoints.test.ts`).
 - Stripe test and live mode verification, HTTPS origin enforcement, webhook signature & replay handling, and Billing Portal sessions (`tests/customerBilling.test.ts`).
 - Zenodo Academic plan enforcement, committed-tree ZIP verification, explicit publish confirmation, and downgrade read access (`tests/customerZenodo.test.ts`).
+- Verification/reset token lifecycle, legacy-account migration, enumeration-safe responses, and production mail config checks (`tests/customerRecovery.test.ts`).
 - Full HTTP integration against the Express app covering health checks, `robots.txt`, AI scraper 403 blocking, auth, CSRF protection, repository/task CRUD & quotas, password rotation, and checkpoint restore (`tests/serverApi.test.ts`).
 
 ## Production Deployment
@@ -53,6 +55,8 @@ The test suite (`tests/*.test.ts`) exercises:
    - `NODE_ENV=production`
    - `PORT=3000` (or platform-injected port)
    - `TRUST_PROXY=1` (when behind Nginx, Cloud Run, Fly.io, Render, or Caddy)
+   - `PUBLIC_ORIGIN` (your `https://` origin, used in emailed links)
+   - `RESEND_API_KEY` and `MAIL_FROM` (sender on a domain verified in Resend; the server refuses to start without them)
    - `LAUNCHPADRE_ACCESS_TOKEN` (32+ random characters)
    - `WEBHOOK_SECRET` (32+ random characters)
    - `LAUNCHPADRE_WORKSPACE_DB=/data/workspace-runtime.db` (on persistent storage)
@@ -73,6 +77,9 @@ docker run -p 3000:3000 \
   -v launchpadre_data:/data \
   -e NODE_ENV=production \
   -e TRUST_PROXY=1 \
+  -e PUBLIC_ORIGIN=https://app.example.com \
+  -e RESEND_API_KEY=re_... \
+  -e MAIL_FROM="LaunchPadre <no-reply@example.com>" \
   -e LAUNCHPADRE_WORKSPACE_DB=/data/workspace-runtime.db \
   -e LAUNCHPADRE_ACCESS_TOKEN="$(openssl rand -hex 32)" \
   -e WEBHOOK_SECRET="$(openssl rand -hex 32)" \

@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
+import { mailerFromEnv, type Mailer } from './src/mailer.ts';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 
@@ -569,6 +570,8 @@ export interface CreateAppOptions {
   zenodoRequest?: typeof fetch;
   zenodoToken?: string;
   zenodoBaseUrl?: string;
+  mailer?: Mailer;
+  publicOrigin?: string;
 }
 
 export async function createApp(options: CreateAppOptions = {}) {
@@ -625,6 +628,34 @@ export async function createApp(options: CreateAppOptions = {}) {
   }
 
   const customerAuth = new CustomerAuth(workspaceDatabase);
+  let mailer: Mailer;
+  let publicOrigin: string;
+  try {
+    mailer = options.mailer ?? mailerFromEnv(production);
+    publicOrigin = (options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? '').replace(/\/+$/, '');
+    if (!publicOrigin && !production) publicOrigin = `http://localhost:${PORT}`;
+    if (production && !/^https:\/\/[^\s/]+$/.test(publicOrigin)) {
+      throw new Error('Production requires PUBLIC_ORIGIN as an https origin (e.g. https://app.example.com)');
+    }
+  } catch (error) {
+    workspaceDatabase.close();
+    throw error;
+  }
+  // Links in account emails always use the configured origin, never the request Host header.
+  const sendMail = (to: string, subject: string, text: string) => {
+    void mailer.send({ to, subject, text }).catch((error) => {
+      console.error('Failed to send account email:', error instanceof Error ? error.message : error);
+    });
+  };
+  const sendVerificationEmail = (customerId: string, email: string) => {
+    const token = customerAuth.issueToken(customerId, 'verify_email');
+    if (!token) return;
+    sendMail(
+      email,
+      'Verify your LaunchPadre email',
+      `Confirm your email address to finish setting up LaunchPadre:\n\n${publicOrigin}/?verify=${token}\n\nThis link expires in 24 hours. If you did not create an account, ignore this message.`
+    );
+  };
   const customerBilling = new CustomerBilling(workspaceDatabase, options.billingRequest);
   app.disable('x-powered-by');
   const accessToken = process.env.LAUNCHPADRE_ACCESS_TOKEN;
@@ -751,6 +782,7 @@ export async function createApp(options: CreateAppOptions = {}) {
         return;
       }
       const account = customerAuth.register(email, password);
+      sendVerificationEmail(account.id, account.email);
       res.status(201).json(account);
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE constraint')) {
@@ -778,8 +810,72 @@ export async function createApp(options: CreateAppOptions = {}) {
       res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
+    if ('unverified' in login) {
+      res.status(403).json({
+        error: 'Verify your email to sign in. Check your inbox or request a new link.',
+        code: 'email_unverified',
+      });
+      return;
+    }
     res.setHeader('Set-Cookie', `lp_customer=${login.token}; ${customerCookieOptions}`);
     res.json({ status: 'authenticated' });
+  });
+
+  // Account-recovery endpoints answer identically whether or not the email has an account.
+  app.post('/api/customer/verify-email', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const token = req.body?.token;
+    if (typeof token !== 'string' || !customerAuth.verifyEmail(token)) {
+      res.status(400).json({ error: 'This verification link is invalid or has expired.' });
+      return;
+    }
+    res.json({ status: 'email_verified' });
+  });
+
+  app.post('/api/customer/resend-verification', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    if (typeof email !== 'string' || email.length > 254) {
+      res.status(400).json({ error: 'Email is required' });
+      return;
+    }
+    const account = customerAuth.findForToken(email);
+    if (account && !account.verified) sendVerificationEmail(account.id, account.email);
+    res.json({ status: 'sent_if_account_exists' });
+  });
+
+  app.post('/api/customer/forgot-password', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    if (typeof email !== 'string' || email.length > 254) {
+      res.status(400).json({ error: 'Email is required' });
+      return;
+    }
+    const account = customerAuth.findForToken(email);
+    const token = account ? customerAuth.issueToken(account.id, 'reset_password') : null;
+    if (account && token) {
+      sendMail(
+        account.email,
+        'Reset your LaunchPadre password',
+        `Use this link to choose a new password:\n\n${publicOrigin}/?reset=${token}\n\nThe link expires in 1 hour and works once. If you did not request this, ignore this message; your password has not changed.`
+      );
+    }
+    res.json({ status: 'sent_if_account_exists' });
+  });
+
+  app.post('/api/customer/reset-password', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const token = req.body?.token;
+    const password = req.body?.password;
+    if (typeof token !== 'string' || typeof password !== 'string') {
+      res.status(400).json({ error: 'Token and new password are required' });
+      return;
+    }
+    try {
+      if (!customerAuth.resetPassword(token, password)) {
+        res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+        return;
+      }
+      res.json({ status: 'password_reset' });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Unable to reset password' });
+    }
   });
 
   app.get('/api/customer/me', (req: Request, res: Response) => {
