@@ -1,8 +1,5 @@
 {
-  "name": "Remix IndieAnchor Git Engine",
-  "description": "A secure, event-driven FastAPI backend that synchronizes Git commit hooks with an integrated markdown-powered Kanban project board.",
-  "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "name": "LaunchPadre",
+  "description": "Multi-tenant developer workspace with guarded Git checkpoints, task tracking, Stripe subscriptions, Zenodo academic DOI archival, and AI-scraper data sovereignty.",
+  "requestFramePermissions": []
 }

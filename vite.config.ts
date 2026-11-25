@@ -2,10 +2,9 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import { defineConfig } from 'vite';
-import { launchPadreApiPlugin } from './src/devApiPlugin.ts';
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), launchPadreApiPlugin()],
+  plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, '.'),
@@ -15,10 +14,6 @@ export default defineConfig({
     host: true,
     port: 3000,
     strictPort: true,
-    middlewareMode: false,
-    hmr: {
-      clientPort: 443,
-    },
   },
   preview: {
     host: true,
