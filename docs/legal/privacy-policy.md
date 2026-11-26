@@ -34,7 +34,6 @@ We use service providers who process data on our behalf:
 - **Stripe**: payments, subscriptions and the billing portal. Stripe is an independent controller for payment and fraud-prevention data under its own privacy policy.
 - **Resend**: sends our verification and password-reset emails (receives your email address and the message content).
 - **Hosting/infrastructure provider [HOSTING_PROVIDER]**: runs the servers, database and backups.
-- **Google Fonts**: the sign-in page loads fonts from Google's servers, which receive your IP address and browser details.
 - **Zenodo (CERN)**: only if you use Academic archiving. See section 4.
 
 We may disclose data if required by law or to protect rights, safety and the security of the Service. If the business is sold or merged, data may transfer to the successor under this policy.
