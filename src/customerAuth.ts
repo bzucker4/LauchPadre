@@ -3,6 +3,8 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypt
 import type { PlanId } from './plans.ts';
 
 export type CustomerAccount = { id: string; email: string; plan: PlanId };
+/** An authenticated account plus whether it has accepted the currently published Terms and Privacy Policy. */
+export type SessionAccount = CustomerAccount & { terms_current: boolean };
 export type TokenPurpose = 'verify_email' | 'reset_password';
 export type LoginResult = { token: string; expiresAt: number } | { unverified: true } | null;
 
@@ -14,7 +16,11 @@ const TOKEN_TTL_MS: Record<TokenPurpose, number> = {
 const TOKEN_COOLDOWN_MS = 60 * 1000;
 
 export class CustomerAuth {
-  constructor(private db: DatabaseSync) {
+  constructor(
+    private db: DatabaseSync,
+    /** Identifies the published Terms/Privacy text. Changing it makes every account accept again. */
+    private termsVersion = 'dev'
+  ) {
     db.exec(`CREATE TABLE IF NOT EXISTS customer_accounts (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free' CHECK(plan IN ('free','indie_solo','academic_tier'))
@@ -41,6 +47,11 @@ export class CustomerAuth {
     if (!columns.some((c) => c.name === 'terms_accepted_at')) {
       db.exec('ALTER TABLE customer_accounts ADD COLUMN terms_accepted_at TEXT');
     }
+    // Which Terms version was accepted. Accounts that accepted before versioning accepted what is current now.
+    if (!columns.some((c) => c.name === 'terms_accepted_version')) {
+      db.exec('ALTER TABLE customer_accounts ADD COLUMN terms_accepted_version TEXT');
+      db.prepare('UPDATE customer_accounts SET terms_accepted_version=? WHERE terms_accepted_at IS NOT NULL').run(termsVersion);
+    }
   }
 
   private hashPassword(password: string) {
@@ -65,8 +76,10 @@ export class CustomerAuth {
     const passwordHash = this.hashPassword(password);
     const id = randomBytes(16).toString('hex');
     this.db
-      .prepare('INSERT INTO customer_accounts (id,email,password_hash,created_at,terms_accepted_at) VALUES (?,?,?,?,?)')
-      .run(id, email, passwordHash, new Date().toISOString(), termsAcceptedAt ?? null);
+      .prepare(
+        'INSERT INTO customer_accounts (id,email,password_hash,created_at,terms_accepted_at,terms_accepted_version) VALUES (?,?,?,?,?,?)'
+      )
+      .run(id, email, passwordHash, new Date().toISOString(), termsAcceptedAt ?? null, termsAcceptedAt ? this.termsVersion : null);
     return { id, email, plan: 'free' };
   }
 
@@ -87,15 +100,24 @@ export class CustomerAuth {
     return { token, expiresAt };
   }
 
-  session(token: string): CustomerAccount | null {
+  session(token: string): SessionAccount | null {
     if (!/^[a-f0-9]{64}$/.test(token)) return null;
-    return (
-      (this.db
-        .prepare(
-          `SELECT a.id,a.email,a.plan FROM customer_sessions s JOIN customer_accounts a ON a.id=s.customer_id WHERE s.token_hash=? AND s.expires_at>?`
-        )
-        .get(this.hash(token), Date.now()) as CustomerAccount | undefined) || null
-    );
+    const row = this.db
+      .prepare(
+        `SELECT a.id,a.email,a.plan,a.terms_accepted_version FROM customer_sessions s JOIN customer_accounts a ON a.id=s.customer_id WHERE s.token_hash=? AND s.expires_at>?`
+      )
+      .get(this.hash(token), Date.now()) as
+      | (CustomerAccount & { terms_accepted_version: string | null })
+      | undefined;
+    if (!row) return null;
+    return { id: row.id, email: row.email, plan: row.plan, terms_current: row.terms_accepted_version === this.termsVersion };
+  }
+
+  /** Records acceptance of the currently published Terms version. */
+  acceptTerms(customerId: string) {
+    this.db
+      .prepare('UPDATE customer_accounts SET terms_accepted_at=?, terms_accepted_version=? WHERE id=?')
+      .run(new Date().toISOString(), this.termsVersion, customerId);
   }
 
   checkPassword(customerId: string, password: string): boolean {

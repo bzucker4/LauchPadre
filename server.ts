@@ -630,7 +630,6 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.set('trust proxy', Number(trustProxy));
   }
 
-  const customerAuth = new CustomerAuth(workspaceDatabase);
   let mailer: Mailer;
   let publicOrigin: string;
   try {
@@ -645,16 +644,17 @@ export async function createApp(options: CreateAppOptions = {}) {
     throw error;
   }
   let legalPages: ReturnType<typeof loadLegalPages>;
+  let legalValues: Record<string, string>;
   try {
-    legalPages = loadLegalPages(
-      path.join(__dirname, 'docs', 'legal'),
-      { ...legalValuesFromEnv(publicOrigin), ...options.legalValues },
-      production
-    );
+    legalValues = { ...legalValuesFromEnv(publicOrigin), ...options.legalValues };
+    legalPages = loadLegalPages(path.join(__dirname, 'docs', 'legal'), legalValues, production);
   } catch (error) {
     workspaceDatabase.close();
     throw error;
   }
+  // The Terms version is the effective date: bumping LEGAL_EFFECTIVE_DATE makes every customer accept again.
+  const termsVersion = legalValues.EFFECTIVE_DATE ?? 'dev';
+  const customerAuth = new CustomerAuth(workspaceDatabase, termsVersion);
   // Links in account emails always use the configured origin, never the request Host header.
   const sendMail = (to: string, subject: string, text: string) => {
     void mailer.send({ to, subject, text }).catch((error) => {
@@ -918,7 +918,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   );
   CREATE INDEX IF NOT EXISTS idx_customer_tasks_repo ON customer_tasks(repository_id);`);
 
-  const requireCustomer = (req: Request, res: Response, next: NextFunction) => {
+  // Signed-in customer, regardless of Terms status. Used only where a customer who declines the
+  // updated Terms must still be able to act (accept them, export their data, delete the account).
+  const requireCustomerAnyTerms = (req: Request, res: Response, next: NextFunction) => {
     const customer = customerAuth.session(customerCookie(req));
     if (!customer) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -927,6 +929,26 @@ export async function createApp(options: CreateAppOptions = {}) {
     res.locals.customer = customer;
     next();
   };
+  const requireCustomer = (req: Request, res: Response, next: NextFunction) =>
+    requireCustomerAnyTerms(req, res, () => {
+      if (!res.locals.customer.terms_current) {
+        res.status(403).json({
+          error: 'Reload the page to review and accept the updated Terms of Service and Privacy Policy.',
+          code: 'terms_acceptance_required',
+        });
+        return;
+      }
+      next();
+    });
+
+  app.post('/api/customer/accept-terms', express.json({ limit: '4kb' }), requireCustomerAnyTerms, (req: Request, res: Response) => {
+    if (req.body?.accepted_terms !== true) {
+      res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy to continue' });
+      return;
+    }
+    customerAuth.acceptTerms(res.locals.customer.id);
+    res.json({ status: 'accepted' });
+  });
 
   const checkpoints = new CustomerCheckpoints(
     workspaceDatabase,
@@ -939,7 +961,7 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   const customerData = new CustomerData(workspaceDatabase, customerAuth, customerBilling, checkpoints, zenodo);
 
-  app.get('/api/customer/export', requireCustomer, (_req: Request, res: Response) => {
+  app.get('/api/customer/export', requireCustomerAnyTerms, (_req: Request, res: Response) => {
     const data = customerData.export(res.locals.customer.id);
     if (!data) {
       res.status(404).json({ error: 'Account not found' });
@@ -952,7 +974,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.post(
     '/api/customer/delete-account',
     express.json({ limit: '4kb' }),
-    requireCustomer,
+    requireCustomerAnyTerms,
     authThrottle,
     async (req: Request, res: Response) => {
       const { id, email } = res.locals.customer as { id: string; email: string };

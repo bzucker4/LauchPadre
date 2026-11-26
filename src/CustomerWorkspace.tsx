@@ -16,7 +16,7 @@ import CustomerCheckpoints from './CustomerCheckpoints.tsx';
 import CustomerZenodo from './CustomerZenodo.tsx';
 import { PLANS, type PlanId } from './plans.ts';
 
-export type CustomerProfile = { id: string; email: string; plan: PlanId };
+export type CustomerProfile = { id: string; email: string; plan: PlanId; terms_current?: boolean };
 type Repo = { id: string; name: string; created_at: string; git_path?: string | null; task_count?: number };
 type TaskStatus = 'todo' | 'in_progress' | 'done';
 type Task = { id: string; title: string; status: TaskStatus; created_at?: string };
@@ -336,7 +336,7 @@ function PasswordPanel({ onUnauthorized }: { onUnauthorized: () => void }) {
   );
 }
 
-function DataPanel({ onUnauthorized, onDeleted }: { onUnauthorized: () => void; onDeleted: () => void }) {
+export function DataPanel({ onUnauthorized, onDeleted }: { onUnauthorized: () => void; onDeleted: () => void }) {
   const [exporting, setExporting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [password, setPassword] = useState('');

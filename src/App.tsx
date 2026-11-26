@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import CustomerWorkspace, { type CustomerProfile } from './CustomerWorkspace.tsx';
+import TermsGate from './TermsGate.tsx';
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -80,6 +81,28 @@ export default function App() {
       <main className="flex min-h-screen items-center justify-center bg-[#070b19] px-4 text-slate-300">
         <p className="text-sm">Connecting to LaunchPadre…</p>
       </main>
+    );
+  }
+
+  if (customer && customer.terms_current === false) {
+    return (
+      <TermsGate
+        email={customer.email}
+        onAccepted={() => setCustomer({ ...customer, terms_current: true })}
+        onLogout={async () => {
+          await fetch('/api/customer/logout', { method: 'POST' });
+          setCustomer(null);
+        }}
+        onUnauthorized={() => {
+          setCustomer(null);
+          setSessionNotice('Your session expired. Sign in again to continue.');
+        }}
+        onDeleted={() => {
+          setCustomer(null);
+          setMode('signin');
+          setSessionNotice('Your account and data were deleted. A confirmation email is on its way.');
+        }}
+      />
     );
   }
 
