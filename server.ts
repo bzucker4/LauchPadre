@@ -9,6 +9,9 @@ import fs from 'fs';
 import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
+import { mailerFromEnv, type Mailer } from './src/mailer.ts';
+import { CustomerData } from './src/customerData.ts';
+import { loadLegalPages, legalValuesFromEnv } from './src/legalPages.ts';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 
@@ -569,6 +572,9 @@ export interface CreateAppOptions {
   zenodoRequest?: typeof fetch;
   zenodoToken?: string;
   zenodoBaseUrl?: string;
+  mailer?: Mailer;
+  publicOrigin?: string;
+  legalValues?: Record<string, string>;
 }
 
 export async function createApp(options: CreateAppOptions = {}) {
@@ -624,7 +630,46 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.set('trust proxy', Number(trustProxy));
   }
 
-  const customerAuth = new CustomerAuth(workspaceDatabase);
+  let mailer: Mailer;
+  let publicOrigin: string;
+  try {
+    mailer = options.mailer ?? mailerFromEnv(production);
+    publicOrigin = (options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? '').replace(/\/+$/, '');
+    if (!publicOrigin && !production) publicOrigin = `http://localhost:${PORT}`;
+    if (production && !/^https:\/\/[^\s/]+$/.test(publicOrigin)) {
+      throw new Error('Production requires PUBLIC_ORIGIN as an https origin (e.g. https://app.example.com)');
+    }
+  } catch (error) {
+    workspaceDatabase.close();
+    throw error;
+  }
+  let legalPages: ReturnType<typeof loadLegalPages>;
+  let legalValues: Record<string, string>;
+  try {
+    legalValues = { ...legalValuesFromEnv(publicOrigin), ...options.legalValues };
+    legalPages = loadLegalPages(path.join(__dirname, 'docs', 'legal'), legalValues, production);
+  } catch (error) {
+    workspaceDatabase.close();
+    throw error;
+  }
+  // The Terms version is the effective date: bumping LEGAL_EFFECTIVE_DATE makes every customer accept again.
+  const termsVersion = legalValues.EFFECTIVE_DATE ?? 'dev';
+  const customerAuth = new CustomerAuth(workspaceDatabase, termsVersion);
+  // Links in account emails always use the configured origin, never the request Host header.
+  const sendMail = (to: string, subject: string, text: string) => {
+    void mailer.send({ to, subject, text }).catch((error) => {
+      console.error('Failed to send account email:', error instanceof Error ? error.message : error);
+    });
+  };
+  const sendVerificationEmail = (customerId: string, email: string) => {
+    const token = customerAuth.issueToken(customerId, 'verify_email');
+    if (!token) return;
+    sendMail(
+      email,
+      'Verify your LaunchPadre email',
+      `Confirm your email address to finish setting up LaunchPadre:\n\n${publicOrigin}/?verify=${token}\n\nThis link expires in 24 hours. If you did not create an account, ignore this message.`
+    );
+  };
   const customerBilling = new CustomerBilling(workspaceDatabase, options.billingRequest);
   app.disable('x-powered-by');
   const accessToken = process.env.LAUNCHPADRE_ACCESS_TOKEN;
@@ -750,7 +795,12 @@ export async function createApp(options: CreateAppOptions = {}) {
         res.status(400).json({ error: 'Email and password are required' });
         return;
       }
-      const account = customerAuth.register(email, password);
+      if (req.body?.accepted_terms !== true) {
+        res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy' });
+        return;
+      }
+      const account = customerAuth.register(email, password, new Date().toISOString());
+      sendVerificationEmail(account.id, account.email);
       res.status(201).json(account);
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE constraint')) {
@@ -778,8 +828,72 @@ export async function createApp(options: CreateAppOptions = {}) {
       res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
+    if ('unverified' in login) {
+      res.status(403).json({
+        error: 'Verify your email to sign in. Check your inbox or request a new link.',
+        code: 'email_unverified',
+      });
+      return;
+    }
     res.setHeader('Set-Cookie', `lp_customer=${login.token}; ${customerCookieOptions}`);
     res.json({ status: 'authenticated' });
+  });
+
+  // Account-recovery endpoints answer identically whether or not the email has an account.
+  app.post('/api/customer/verify-email', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const token = req.body?.token;
+    if (typeof token !== 'string' || !customerAuth.verifyEmail(token)) {
+      res.status(400).json({ error: 'This verification link is invalid or has expired.' });
+      return;
+    }
+    res.json({ status: 'email_verified' });
+  });
+
+  app.post('/api/customer/resend-verification', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    if (typeof email !== 'string' || email.length > 254) {
+      res.status(400).json({ error: 'Email is required' });
+      return;
+    }
+    const account = customerAuth.findForToken(email);
+    if (account && !account.verified) sendVerificationEmail(account.id, account.email);
+    res.json({ status: 'sent_if_account_exists' });
+  });
+
+  app.post('/api/customer/forgot-password', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const email = req.body?.email;
+    if (typeof email !== 'string' || email.length > 254) {
+      res.status(400).json({ error: 'Email is required' });
+      return;
+    }
+    const account = customerAuth.findForToken(email);
+    const token = account ? customerAuth.issueToken(account.id, 'reset_password') : null;
+    if (account && token) {
+      sendMail(
+        account.email,
+        'Reset your LaunchPadre password',
+        `Use this link to choose a new password:\n\n${publicOrigin}/?reset=${token}\n\nThe link expires in 1 hour and works once. If you did not request this, ignore this message; your password has not changed.`
+      );
+    }
+    res.json({ status: 'sent_if_account_exists' });
+  });
+
+  app.post('/api/customer/reset-password', express.json({ limit: '4kb' }), authThrottle, (req: Request, res: Response) => {
+    const token = req.body?.token;
+    const password = req.body?.password;
+    if (typeof token !== 'string' || typeof password !== 'string') {
+      res.status(400).json({ error: 'Token and new password are required' });
+      return;
+    }
+    try {
+      if (!customerAuth.resetPassword(token, password)) {
+        res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+        return;
+      }
+      res.json({ status: 'password_reset' });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Unable to reset password' });
+    }
   });
 
   app.get('/api/customer/me', (req: Request, res: Response) => {
@@ -804,7 +918,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   );
   CREATE INDEX IF NOT EXISTS idx_customer_tasks_repo ON customer_tasks(repository_id);`);
 
-  const requireCustomer = (req: Request, res: Response, next: NextFunction) => {
+  // Signed-in customer, regardless of Terms status. Used only where a customer who declines the
+  // updated Terms must still be able to act (accept them, export their data, delete the account).
+  const requireCustomerAnyTerms = (req: Request, res: Response, next: NextFunction) => {
     const customer = customerAuth.session(customerCookie(req));
     if (!customer) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -813,6 +929,26 @@ export async function createApp(options: CreateAppOptions = {}) {
     res.locals.customer = customer;
     next();
   };
+  const requireCustomer = (req: Request, res: Response, next: NextFunction) =>
+    requireCustomerAnyTerms(req, res, () => {
+      if (!res.locals.customer.terms_current) {
+        res.status(403).json({
+          error: 'Reload the page to review and accept the updated Terms of Service and Privacy Policy.',
+          code: 'terms_acceptance_required',
+        });
+        return;
+      }
+      next();
+    });
+
+  app.post('/api/customer/accept-terms', express.json({ limit: '4kb' }), requireCustomerAnyTerms, (req: Request, res: Response) => {
+    if (req.body?.accepted_terms !== true) {
+      res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy to continue' });
+      return;
+    }
+    customerAuth.acceptTerms(res.locals.customer.id);
+    res.json({ status: 'accepted' });
+  });
 
   const checkpoints = new CustomerCheckpoints(
     workspaceDatabase,
@@ -822,6 +958,56 @@ export async function createApp(options: CreateAppOptions = {}) {
     token: options.zenodoToken,
     baseUrl: options.zenodoBaseUrl,
   });
+
+  const customerData = new CustomerData(workspaceDatabase, customerAuth, customerBilling, checkpoints, zenodo);
+
+  app.get('/api/customer/export', requireCustomerAnyTerms, (_req: Request, res: Response) => {
+    const data = customerData.export(res.locals.customer.id);
+    if (!data) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="launchpadre-export-${data.exported_at.slice(0, 10)}.json"`);
+    res.type('application/json').send(JSON.stringify(data, null, 2));
+  });
+
+  app.post(
+    '/api/customer/delete-account',
+    express.json({ limit: '4kb' }),
+    requireCustomerAnyTerms,
+    authThrottle,
+    async (req: Request, res: Response) => {
+      const { id, email } = res.locals.customer as { id: string; email: string };
+      if (req.body?.confirm !== 'DELETE' || typeof req.body?.password !== 'string') {
+        res.status(400).json({ error: 'Enter your password and type DELETE to confirm' });
+        return;
+      }
+      if (!customerAuth.checkPassword(id, req.body.password)) {
+        res.status(401).json({ error: 'Password is incorrect' });
+        return;
+      }
+      try {
+        await customerData.deleteAccount(id);
+      } catch (error) {
+        console.error('Account deletion failed:', error instanceof Error ? error.message : error);
+        const known = error instanceof ZenodoArchiveError || error instanceof CheckpointError;
+        res.status(known ? error.status : 502).json({
+          error: known
+            ? error.message
+            : 'We could not cancel your subscription, so nothing was deleted. Try again shortly or contact support.',
+        });
+        return;
+      }
+      recordLog('INFO', 'ACCOUNT_DELETED', 200, 'Customer account deleted at the customer\'s request');
+      sendMail(
+        email,
+        'Your LaunchPadre account was deleted',
+        'Your LaunchPadre account, workspace data and subscription have been deleted. Records we must keep for tax or legal reasons, and anything you published to Zenodo, are not affected.\n\nIf you did not request this, contact us immediately.'
+      );
+      res.setHeader('Set-Cookie', `lp_customer=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${production ? '; Secure' : ''}`);
+      res.json({ status: 'deleted' });
+    }
+  );
 
   function checkpointResponse(res: Response, action: () => unknown, status = 200) {
     try {
@@ -1715,6 +1901,10 @@ export async function createApp(options: CreateAppOptions = {}) {
     if (production) { res.status(403).json({ error: 'Reset disabled in production' }); return; }
     db = createInitialStore();
     res.json({ status: 'reset' });
+  });
+
+  app.get(['/terms', '/privacy'], (req: Request, res: Response) => {
+    res.type('html').send(legalPages[req.path === '/terms' ? 'terms' : 'privacy']);
   });
 
   // Unknown API/auth routes always return JSON 404 instead of SPA HTML

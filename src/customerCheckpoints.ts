@@ -20,6 +20,28 @@ export class CustomerCheckpoints {
     )`);
   }
 
+  /**
+   * Removes the customer's provisioned Git directory (<root>/<customer ID>). Refuses anything that is
+   * not an ordinary directory directly beneath the root, and never follows symlinks.
+   */
+  removeTenantData(customerId: string): boolean {
+    if (!this.root || !fs.existsSync(this.root)) return false;
+    if (!/^[a-f0-9]{32}$/.test(customerId)) throw new CheckpointError(400, 'Invalid customer');
+    const base = fs.realpathSync(this.root);
+    const tenant = path.join(base, customerId);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(tenant);
+    } catch {
+      return false;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(tenant) !== tenant) {
+      throw new CheckpointError(409, 'Customer Git directory is not a regular directory; ask the workspace operator');
+    }
+    fs.rmSync(tenant, { recursive: true, force: true });
+    return true;
+  }
+
   private owned(customer: Customer, repositoryId: string) {
     const repo = this.db.prepare('SELECT id FROM customer_repositories WHERE id=? AND customer_id=?')
       .get(repositoryId, customer.id);
