@@ -7,6 +7,7 @@ export default function App() {
   const [customer, setCustomer] = useState<CustomerProfile | null>(null);
   const [mode, setMode] = useState<'signin' | 'register' | 'forgot' | 'reset'>('signin');
   const register = mode === 'register';
+  const [acceptedTerms, setAcceptedTerms] = useState(false);
   const [resetToken, setResetToken] = useState('');
   const [needsVerification, setNeedsVerification] = useState(false);
   const [email, setEmail] = useState('');
@@ -154,7 +155,7 @@ export default function App() {
         return;
       }
       if (register) {
-        const { response, data } = await post('/api/customer/register', { email, password });
+        const { response, data } = await post('/api/customer/register', { email, password, accepted_terms: acceptedTerms });
         if (!response.ok) throw new Error(data.error || 'Registration failed');
         setPassword('');
         setMode('signin');
@@ -256,6 +257,28 @@ export default function App() {
             )}
           </label>
           )}
+          {register && (
+            <label className="flex items-start gap-2.5 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                required
+                checked={acceptedTerms}
+                onChange={(e) => setAcceptedTerms(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-amber-400"
+              />
+              <span>
+                I agree to the{' '}
+                <a href="/terms" target="_blank" rel="noopener" className="text-amber-300 underline hover:text-amber-200">
+                  Terms of Service
+                </a>{' '}
+                and{' '}
+                <a href="/privacy" target="_blank" rel="noopener" className="text-amber-300 underline hover:text-amber-200">
+                  Privacy Policy
+                </a>
+                .
+              </span>
+            </label>
+          )}
           <button
             type="submit"
             disabled={busy}
@@ -296,6 +319,10 @@ export default function App() {
       <p className="mt-6 flex items-center gap-1.5 text-xs text-slate-500">
         <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
         Protected by LaunchPadre 3-layer AI-scraper data sovereignty
+      </p>
+      <p className="mt-2 flex gap-4 text-xs text-slate-500">
+        <a href="/terms" className="hover:text-amber-300">Terms</a>
+        <a href="/privacy" className="hover:text-amber-300">Privacy</a>
       </p>
     </main>
   );

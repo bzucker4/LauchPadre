@@ -6,6 +6,7 @@ LaunchPadre is a multi-tenant developer workspace built with Express, React, Vit
 
 - **Isolated customer workspaces**: Salted `scrypt` password authentication, `HttpOnly; SameSite=Lax` cookie sessions with CSRF `Origin` / `Sec-Fetch-Site` enforcement, password rotation that revokes other active sessions, and per-customer SQLite data isolation with foreign-key cascading.
 - **Email verification & password reset**: New accounts must verify their email before signing in (accounts created before this feature are grandfathered as verified). Single-use, hashed tokens (verification 24h, reset 1h) are sent through Resend; links use the configured `PUBLIC_ORIGIN`, never the request Host header. Reset and resend endpoints answer identically whether or not an account exists, and completing a reset signs out every session.
+- **Legal pages**: Terms of Service and Privacy Policy drafts in `docs/legal` are served at `/terms` and `/privacy`; sign-up requires explicit acceptance, recorded with a timestamp.
 - **Guarded Git checkpoints & restore** ([`docs/customer-checkpoints.md`](docs/customer-checkpoints.md)): Operator-provisioned tenant directories (`<LAUNCHPADRE_CUSTOMER_GIT_ROOT>/<customer ID>/<repo>`), path-traversal/symlink/worktree rejection, disabled Git hooks/filters/fsmonitor, immutable `panic_room_launchpadre_<name>` tags, clean-worktree enforcement (including untracked & ignored files), and automatic `refs/launchpadre/recovery/<UUID>` creation before resetting HEAD.
 - **Stripe billing (test & live)**: Server-verified USD Price catalog (`Indie Solo` \$5/mo or \$39/yr; `Academic Researcher` \$9/mo or \$69/yr), strict test vs live mode matching across prices/webhooks/subscriptions, raw-body HMAC webhook reconciliation, and Stripe Billing Portal self-service management.
 - **Academic DOI archival (Zenodo)**: Available on the `Academic Researcher` plan. Packages committed `HEAD` via hardened `git archive --format=zip` (never includes `.git` or untracked files), uploads a draft deposition to Zenodo Sandbox or Production, and mints a permanent DOI with Markdown badge only after explicit confirmation.
@@ -57,6 +58,7 @@ The test suite (`tests/*.test.ts`) exercises:
    - `TRUST_PROXY=1` (when behind Nginx, Cloud Run, Fly.io, Render, or Caddy)
    - `PUBLIC_ORIGIN` (your `https://` origin, used in emailed links)
    - `RESEND_API_KEY` and `MAIL_FROM` (sender on a domain verified in Resend; the server refuses to start without them)
+   - `LEGAL_COMPANY`, `LEGAL_ADDRESS`, `LEGAL_CONTACT_EMAIL`, `LEGAL_GOVERNING_LAW`, `LEGAL_EFFECTIVE_DATE`, `LEGAL_HOSTING_PROVIDER`, `LEGAL_LOG_RETENTION`, `LEGAL_BACKUP_RETENTION` (fill the Terms and Privacy Policy served at `/terms` and `/privacy`; see [`docs/legal`](docs/legal/README.md))
    - `LAUNCHPADRE_ACCESS_TOKEN` (32+ random characters)
    - `WEBHOOK_SECRET` (32+ random characters)
    - `LAUNCHPADRE_WORKSPACE_DB=/data/workspace-runtime.db` (on persistent storage)

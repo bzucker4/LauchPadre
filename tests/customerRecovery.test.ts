@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { CustomerAuth } from '../src/customerAuth.ts';
 import { ResendMailer } from '../src/mailer.ts';
 import { createApp } from '../server.ts';
+import { LEGAL_PLACEHOLDERS, renderMarkdown } from '../src/legalPages.ts';
 
 test('email verification and password reset tokens: single-use, expiring, session-revoking', () => {
   const db = new DatabaseSync(':memory:');
@@ -93,7 +94,7 @@ test('HTTP recovery flows send links on the configured origin and do not reveal 
   const flush = () => new Promise((r) => setTimeout(r, 20));
 
   try {
-    assert.equal((await post('/api/customer/register', { email: 'sam@example.com', password: 'sam-password-1234' })).status, 201);
+    assert.equal((await post('/api/customer/register', { email: 'sam@example.com', password: 'sam-password-1234', accepted_terms: true })).status, 201);
     await flush();
     // Host header must not influence the emailed link.
     assert.match(mails[0].text, /^.*https:\/\/app\.example\.test\/\?verify=[a-f0-9]{64}/s);
@@ -141,11 +142,16 @@ test('production refuses to boot without mail and public origin configuration', 
     process.env.RESEND_API_KEY = 're_test';
     process.env.MAIL_FROM = 'LaunchPadre <no-reply@example.com>';
     await assert.rejects(createApp({ workspaceDbPath: ':memory:', production: true, attachVite: false }), /PUBLIC_ORIGIN/);
+    await assert.rejects(
+      createApp({ workspaceDbPath: ':memory:', production: true, attachVite: false, publicOrigin: 'https://app.example.com' }),
+      /LEGAL_COMPANY/
+    );
     const { close } = await createApp({
       workspaceDbPath: ':memory:',
       production: true,
       attachVite: false,
       publicOrigin: 'https://app.example.com',
+      legalValues: Object.fromEntries(LEGAL_PLACEHOLDERS.map((n) => [n, `value-${n}`])),
     });
     await close();
   } finally {
@@ -165,4 +171,61 @@ test('ResendMailer posts the message and surfaces provider rejection', async () 
   assert.deepEqual(calls[0].body.to, ['a@example.com']);
   const bad = new ResendMailer('k', 'f', async () => ({ ok: false, status: 422 }));
   await assert.rejects(bad.send({ to: 'a@example.com', subject: 's', text: 't' }), /HTTP 422/);
+});
+
+test('legal pages are served with configured values and registration requires accepting them', async () => {
+  const { app, database, close } = await createApp({
+    workspaceDbPath: ':memory:',
+    production: false,
+    attachVite: false,
+    mailer: { async send() {} },
+    publicOrigin: 'https://app.example.test',
+    legalValues: { COMPANY: 'Acme <script>x</script> Inc', CONTACT_EMAIL: 'legal@acme.test' },
+  });
+  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const register = (body: object) =>
+    fetch(`${base}/api/customer/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  try {
+    for (const [route, heading] of [['/terms', 'LaunchPadre Terms of Service'], ['/privacy', 'LaunchPadre Privacy Policy']]) {
+      const page = await fetch(`${base}${route}`);
+      assert.equal(page.status, 200);
+      assert.match(page.headers.get('content-type') || '', /text\/html/);
+      const html = await page.text();
+      assert.ok(html.includes(`<h1>${heading}</h1>`));
+      assert.ok(html.includes('legal@acme.test'));
+      assert.ok(html.includes('Acme &lt;script&gt;x&lt;/script&gt; Inc'), 'configured values are HTML-escaped');
+      assert.ok(!html.includes('<script>x'));
+      assert.ok(html.includes('https://app.example.test'), 'PRODUCT_URL comes from PUBLIC_ORIGIN');
+    }
+
+    const noConsent = await register({ email: 'zed@example.com', password: 'zed-password-1234' });
+    assert.equal(noConsent.status, 400);
+    const falseConsent = await register({ email: 'zed@example.com', password: 'zed-password-1234', accepted_terms: 'yes' });
+    assert.equal(falseConsent.status, 400);
+    const ok = await register({ email: 'zed@example.com', password: 'zed-password-1234', accepted_terms: true });
+    assert.equal(ok.status, 201);
+    const row = database.prepare('SELECT terms_accepted_at FROM customer_accounts WHERE email=?').get('zed@example.com') as {
+      terms_accepted_at: string | null;
+    };
+    assert.ok(row.terms_accepted_at && !Number.isNaN(Date.parse(row.terms_accepted_at)));
+  } finally {
+    await new Promise((r) => server.close(r));
+    await close();
+  }
+});
+
+test('markdown renderer escapes HTML and renders lists, tables and emphasis', () => {
+  const { title, body } = renderMarkdown('# T <b>\n\n**Bold:** a\nsecond line\n\n- one\n- two\n\n| H1 | H2 |\n|---|---|\n| a | `b` |\n');
+  assert.equal(title, 'T <b>');
+  assert.ok(body.includes('<h1>T &lt;b&gt;</h1>'));
+  assert.ok(body.includes('<p><strong>Bold:</strong> a<br>second line</p>'));
+  assert.ok(body.includes('<ul><li>one</li><li>two</li></ul>'));
+  assert.ok(body.includes('<th>H1</th>') && body.includes('<td><code>b</code></td>'));
 });

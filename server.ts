@@ -10,6 +10,7 @@ import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
 import { mailerFromEnv, type Mailer } from './src/mailer.ts';
+import { loadLegalPages, legalValuesFromEnv } from './src/legalPages.ts';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 
@@ -572,6 +573,7 @@ export interface CreateAppOptions {
   zenodoBaseUrl?: string;
   mailer?: Mailer;
   publicOrigin?: string;
+  legalValues?: Record<string, string>;
 }
 
 export async function createApp(options: CreateAppOptions = {}) {
@@ -637,6 +639,17 @@ export async function createApp(options: CreateAppOptions = {}) {
     if (production && !/^https:\/\/[^\s/]+$/.test(publicOrigin)) {
       throw new Error('Production requires PUBLIC_ORIGIN as an https origin (e.g. https://app.example.com)');
     }
+  } catch (error) {
+    workspaceDatabase.close();
+    throw error;
+  }
+  let legalPages: ReturnType<typeof loadLegalPages>;
+  try {
+    legalPages = loadLegalPages(
+      path.join(__dirname, 'docs', 'legal'),
+      { ...legalValuesFromEnv(publicOrigin), ...options.legalValues },
+      production
+    );
   } catch (error) {
     workspaceDatabase.close();
     throw error;
@@ -781,7 +794,11 @@ export async function createApp(options: CreateAppOptions = {}) {
         res.status(400).json({ error: 'Email and password are required' });
         return;
       }
-      const account = customerAuth.register(email, password);
+      if (req.body?.accepted_terms !== true) {
+        res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy' });
+        return;
+      }
+      const account = customerAuth.register(email, password, new Date().toISOString());
       sendVerificationEmail(account.id, account.email);
       res.status(201).json(account);
     } catch (error) {
@@ -1811,6 +1828,10 @@ export async function createApp(options: CreateAppOptions = {}) {
     if (production) { res.status(403).json({ error: 'Reset disabled in production' }); return; }
     db = createInitialStore();
     res.json({ status: 'reset' });
+  });
+
+  app.get(['/terms', '/privacy'], (req: Request, res: Response) => {
+    res.type('html').send(legalPages[req.path === '/terms' ? 'terms' : 'privacy']);
   });
 
   // Unknown API/auth routes always return JSON 404 instead of SPA HTML

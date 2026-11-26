@@ -34,7 +34,7 @@ We use service providers who process data on our behalf:
 - **Stripe**: payments, subscriptions and the billing portal. Stripe is an independent controller for payment and fraud-prevention data under its own privacy policy.
 - **Resend**: sends our verification and password-reset emails (receives your email address and the message content).
 - **Hosting/infrastructure provider [HOSTING_PROVIDER]**: runs the servers, database and backups.
-- **Google Fonts**: the sign-in page loads fonts from Google's servers, which receive your IP address and browser details. [Remove this line once fonts are self-hosted.]
+- **Google Fonts**: the sign-in page loads fonts from Google's servers, which receive your IP address and browser details.
 - **Zenodo (CERN)**: only if you use Academic archiving. See section 4.
 
 We may disclose data if required by law or to protect rights, safety and the security of the Service. If the business is sold or merged, data may transfer to the successor under this policy.
@@ -48,9 +48,9 @@ Our providers may process data outside your country, including in the United Sta
 ## 6. How long we keep data
 - **Account, workspace and repository data:** until you ask us to delete your account.
 - **Sessions:** expire after 8 hours. **Email tokens:** expire after 24 hours / 1 hour and are removed when superseded or used.
-- **Logs:** [LOG_RETENTION, e.g. up to 30 days].
+- **Logs:** [LOG_RETENTION].
 - **Billing records:** kept as long as tax and accounting law requires (generally 7 years) by us and Stripe.
-- **Backups:** deleted data may remain in encrypted backups for up to [BACKUP_RETENTION, e.g. 35 days] before being overwritten.
+- **Backups:** deleted data may remain in encrypted backups for up to [BACKUP_RETENTION] before being overwritten.
 - **Zenodo publications:** controlled by Zenodo and generally permanent.
 
 ## 7. Your rights
@@ -71,4 +71,4 @@ We do not track you across sites, so there is nothing for Do Not Track to disabl
 We will post updates here with a new effective date, and notify you by email or in the Service at least 30 days ahead of material changes.
 
 ## 12. Contact
-[COMPANY], [ADDRESS], [CONTACT_EMAIL]. [If you are in the EU/UK and we are required to appoint a representative or DPO, list them here.]
+[COMPANY], [ADDRESS], [CONTACT_EMAIL].

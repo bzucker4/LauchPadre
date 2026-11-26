@@ -89,7 +89,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     const regA = await fetch(`${base}/api/customer/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery', accepted_terms: true }),
     });
     assert.equal(regA.status, 201);
     const accountA = await regA.json();
@@ -98,7 +98,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     const dupA = await fetch(`${base}/api/customer/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'ALICE@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'ALICE@example.com', password: 'correct-horse-battery', accepted_terms: true }),
     });
     assert.equal(dupA.status, 409);
 
@@ -106,7 +106,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     const blockedLogin = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery', accepted_terms: true }),
     });
     assert.equal(blockedLogin.status, 403);
     assert.equal((await blockedLogin.json()).code, 'email_unverified');
@@ -115,7 +115,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     const loginA = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery', accepted_terms: true }),
     });
     assert.equal(loginA.status, 200);
     const setCookieA = loginA.headers.get('set-cookie') || '';
@@ -127,7 +127,7 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     const loginA2 = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery' }),
+      body: JSON.stringify({ email: 'alice@example.com', password: 'correct-horse-battery', accepted_terms: true }),
     });
     const cookieA2 = (loginA2.headers.get('set-cookie') || '').split(';')[0];
 
@@ -217,13 +217,13 @@ test('HTTP server end-to-end: sovereignty, auth, CSRF, CRUD, quotas, password ro
     await fetch(`${base}/api/customer/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'bob@example.com', password: 'bob-password-1234' }),
+      body: JSON.stringify({ email: 'bob@example.com', password: 'bob-password-1234', accepted_terms: true }),
     });
     await verifyLatestEmail(base, 'bob@example.com');
     const loginB = await fetch(`${base}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'bob@example.com', password: 'bob-password-1234' }),
+      body: JSON.stringify({ email: 'bob@example.com', password: 'bob-password-1234', accepted_terms: true }),
     });
     const cookieB = (loginB.headers.get('set-cookie') || '').split(';')[0];
 

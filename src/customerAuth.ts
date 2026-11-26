@@ -37,6 +37,10 @@ export class CustomerAuth {
       db.exec('ALTER TABLE customer_accounts ADD COLUMN email_verified_at TEXT');
       db.exec('UPDATE customer_accounts SET email_verified_at=created_at');
     }
+    // Records when the customer accepted the Terms and Privacy Policy (null for older accounts).
+    if (!columns.some((c) => c.name === 'terms_accepted_at')) {
+      db.exec('ALTER TABLE customer_accounts ADD COLUMN terms_accepted_at TEXT');
+    }
   }
 
   private hashPassword(password: string) {
@@ -50,7 +54,7 @@ export class CustomerAuth {
     return Boolean(storedHash) && timingSafeEqual(actual, Buffer.from(expected, 'hex'));
   }
 
-  register(emailInput: string, password: string): CustomerAccount {
+  register(emailInput: string, password: string, termsAcceptedAt?: string): CustomerAccount {
     const email = emailInput.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
       throw new Error('Enter a valid email address');
@@ -61,8 +65,8 @@ export class CustomerAuth {
     const passwordHash = this.hashPassword(password);
     const id = randomBytes(16).toString('hex');
     this.db
-      .prepare('INSERT INTO customer_accounts (id,email,password_hash,created_at) VALUES (?,?,?,?)')
-      .run(id, email, passwordHash, new Date().toISOString());
+      .prepare('INSERT INTO customer_accounts (id,email,password_hash,created_at,terms_accepted_at) VALUES (?,?,?,?,?)')
+      .run(id, email, passwordHash, new Date().toISOString(), termsAcceptedAt ?? null);
     return { id, email, plan: 'free' };
   }
 
