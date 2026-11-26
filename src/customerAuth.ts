@@ -98,6 +98,18 @@ export class CustomerAuth {
     );
   }
 
+  checkPassword(customerId: string, password: string): boolean {
+    const row = this.db
+      .prepare('SELECT password_hash FROM customer_accounts WHERE id=?')
+      .get(customerId) as { password_hash: string } | undefined;
+    return Boolean(row) && password.length <= 1024 && this.verifyPassword(password, row!.password_hash);
+  }
+
+  /** Deletes the account row; sessions, tokens, repositories, tasks, Git bindings, archives and billing links cascade. */
+  deleteAccount(customerId: string) {
+    this.db.prepare('DELETE FROM customer_accounts WHERE id=?').run(customerId);
+  }
+
   changePassword(customerId: string, currentPassword: string, newPassword: string, keepToken?: string) {
     if (newPassword.length < 12 || newPassword.length > 1024) {
       throw new Error('New password must be between 12 and 1024 characters');

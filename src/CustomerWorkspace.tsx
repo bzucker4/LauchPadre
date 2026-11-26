@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   CreditCard,
+  Download,
   FolderGit2,
   KeyRound,
   ListTodo,
@@ -335,16 +336,158 @@ function PasswordPanel({ onUnauthorized }: { onUnauthorized: () => void }) {
   );
 }
 
+function DataPanel({ onUnauthorized, onDeleted }: { onUnauthorized: () => void; onDeleted: () => void }) {
+  const [exporting, setExporting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [password, setPassword] = useState('');
+  const [confirmText, setConfirmText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function exportData() {
+    setError('');
+    setExporting(true);
+    try {
+      const response = await fetch('/api/customer/export');
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!response.ok) throw new Error('Could not export your data');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = /filename="([^"]+)"/.exec(response.headers.get('content-disposition') || '')?.[1] || 'launchpadre-export.json';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not export your data');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function deleteAccount(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    setBusy(true);
+    try {
+      const response = await fetch('/api/customer/delete-account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password, confirm: confirmText }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 401 && data.error === 'Unauthorized') {
+        onUnauthorized();
+        return;
+      }
+      if (!response.ok) throw new Error(data.error || 'Could not delete your account');
+      onDeleted();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete your account');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className={panel} aria-labelledby="data-title">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Download className="h-4 w-4 text-amber-400" aria-hidden="true" />
+          <h2 id="data-title" className="text-lg font-semibold text-slate-100">
+            Your Data
+          </h2>
+        </div>
+        <button type="button" className={button} onClick={exportData} disabled={exporting}>
+          {exporting ? 'Preparing…' : 'Download my data (JSON)'}
+        </button>
+      </div>
+      <p className="mt-2 text-sm text-slate-400">
+        The export includes your account details, repositories, tasks and archive records. It never includes your
+        password or sessions. Repository source stays in your own Git repositories.
+      </p>
+
+      <div className="mt-5 border-t border-slate-800 pt-4">
+        {!confirming ? (
+          <button type="button" className={dangerButton} onClick={() => setConfirming(true)}>
+            <Trash2 className="h-4 w-4" aria-hidden="true" />
+            Delete my account
+          </button>
+        ) : (
+          <form onSubmit={deleteAccount} className="space-y-3">
+            <p className="text-sm text-rose-200">
+              This permanently deletes your account, repositories, tasks and Git checkpoints, and cancels your
+              subscription immediately with no refund for the current period. It cannot be undone. Anything already
+              published to Zenodo stays public. Download your data first.
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="block text-sm text-slate-300">
+                Password
+                <input
+                  type="password"
+                  className={field + ' mt-1.5'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  required
+                />
+              </label>
+              <label className="block text-sm text-slate-300">
+                Type DELETE to confirm
+                <input
+                  className={field + ' mt-1.5'}
+                  value={confirmText}
+                  onChange={(e) => setConfirmText(e.target.value)}
+                  autoComplete="off"
+                  required
+                />
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button type="submit" className={dangerButton} disabled={busy || confirmText !== 'DELETE'}>
+                {busy ? 'Deleting…' : 'Permanently delete account'}
+              </button>
+              <button
+                type="button"
+                className={button}
+                onClick={() => {
+                  setConfirming(false);
+                  setPassword('');
+                  setConfirmText('');
+                  setError('');
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+        {error && (
+          <p role="alert" className="mt-3 text-sm text-rose-300">
+            {error}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function CustomerWorkspace({
   customer,
   checkoutReturn,
   onLogout,
   onSessionExpired,
+  onAccountDeleted,
 }: {
   customer: CustomerProfile;
   checkoutReturn: string | null;
   onLogout: () => void;
   onSessionExpired: () => void;
+  onAccountDeleted: () => void;
 }) {
   const [plan, setPlan] = useState<PlanId>(customer.plan);
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -754,6 +897,7 @@ export default function CustomerWorkspace({
         )}
 
         <PasswordPanel onUnauthorized={onSessionExpired} />
+        <DataPanel onUnauthorized={onSessionExpired} onDeleted={onAccountDeleted} />
       </main>
     </div>
   );

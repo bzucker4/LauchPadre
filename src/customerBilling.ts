@@ -70,9 +70,28 @@ export class CustomerBilling {
     );
   }
 
-  private async stripe(route: string, body?: URLSearchParams, idempotencyKey?: string) {
+  /**
+   * Deletes the account's Stripe customer, which cancels its subscriptions immediately.
+   * No-op when the account never started checkout. Throws if billing cannot be reached so the
+   * caller can stop before anything irreversible happens.
+   */
+  async deleteStripeCustomer(accountId: string): Promise<void> {
+    const mapping = this.db
+      .prepare('SELECT stripe_customer_id FROM stripe_customer_accounts WHERE account_id=?')
+      .get(accountId) as { stripe_customer_id: string } | undefined;
+    if (!mapping) return;
+    if (!this.configured()) throw new Error('Billing is not configured, so the subscription cannot be cancelled');
+    try {
+      await this.stripe('customers/' + encodeURIComponent(mapping.stripe_customer_id), undefined, undefined, 'DELETE');
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return; // already gone
+      throw error;
+    }
+  }
+
+  private async stripe(route: string, body?: URLSearchParams, idempotencyKey?: string, method?: 'DELETE') {
     const response = await this.request('https://api.stripe.com/v1/' + route, {
-      method: body ? 'POST' : 'GET',
+      method: method ?? (body ? 'POST' : 'GET'),
       body,
       redirect: 'error',
       headers: {
@@ -81,7 +100,7 @@ export class CustomerBilling {
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) throw new Error('Stripe request failed');
+    if (!response.ok) throw Object.assign(new Error('Stripe request failed'), { status: response.status });
     return response.json();
   }
 

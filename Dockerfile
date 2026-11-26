@@ -24,7 +24,7 @@ RUN npm ci --omit=dev && npm install --no-save tsx
 
 COPY --from=builder /app/dist ./dist
 COPY server.ts ./
-COPY src/customerAuth.ts src/customerBilling.ts src/customerCheckpoints.ts src/customerZenodo.ts src/gitWorkspace.ts src/legalPages.ts src/mailer.ts src/plans.ts ./src/
+COPY src/customerAuth.ts src/customerBilling.ts src/customerCheckpoints.ts src/customerData.ts src/customerZenodo.ts src/gitWorkspace.ts src/legalPages.ts src/mailer.ts src/plans.ts ./src/
 COPY docs/legal ./docs/legal
 COPY backend_python ./backend_python
 

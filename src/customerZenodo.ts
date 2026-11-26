@@ -144,6 +144,37 @@ export class CustomerZenodo {
     };
   }
 
+  /**
+   * Deletes the customer's unpublished draft depositions from Zenodo. Published records are permanent
+   * and untouched. Throws if any draft cannot be removed so the account is not deleted with data left behind.
+   */
+  async deleteDrafts(customerId: string): Promise<number> {
+    const drafts = this.db
+      .prepare("SELECT deposition_id, sandbox FROM customer_zenodo_archives WHERE customer_id=? AND status='draft'")
+      .all(customerId) as { deposition_id: string; sandbox: number }[];
+    let removed = 0;
+    for (const draft of drafts) {
+      const targetBase = draft.sandbox ? 'https://sandbox.zenodo.org' : 'https://zenodo.org';
+      if (!this.token || targetBase !== this.baseUrl) {
+        throw new ZenodoArchiveError(503, 'Zenodo is not configured for your draft archives; contact support to finish deletion');
+      }
+      const response = await this.request(
+        `${this.baseUrl}/api/deposit/depositions/${encodeURIComponent(String(draft.deposition_id))}`,
+        {
+          method: 'DELETE',
+          redirect: 'error',
+          headers: { Authorization: `Bearer ${this.token}` },
+          signal: AbortSignal.timeout(20_000),
+        }
+      );
+      if (response.ok) removed += 1;
+      else if (response.status !== 404 && response.status !== 410) {
+        throw new ZenodoArchiveError(502, 'Zenodo could not remove your draft archives; try again later');
+      }
+    }
+    return removed;
+  }
+
   async createDraft(
     customer: Customer,
     repositoryId: string,

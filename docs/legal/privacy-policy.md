@@ -54,7 +54,7 @@ Our providers may process data outside your country, including in the United Sta
 - **Zenodo publications:** controlled by Zenodo and generally permanent.
 
 ## 7. Your rights
-Depending on where you live (for example under the GDPR/UK GDPR or CCPA/CPRA) you may have the right to access, correct, delete, export or restrict use of your personal data, to object to processing, to withdraw consent, and to complain to your data-protection authority. Email [CONTACT_EMAIL] from your account email. We will verify the request and respond within 30 days. At present, deletion and data export are handled manually on request; they are not yet self-service.
+Depending on where you live (for example under the GDPR/UK GDPR or CCPA/CPRA) you may have the right to access, correct, delete, export or restrict use of your personal data, to object to processing, to withdraw consent, and to complain to your data-protection authority. Email [CONTACT_EMAIL] from your account email. We will verify the request and respond within 30 days. You can also do this yourself in the app under **Your Data**: download a JSON export of your account, repositories, tasks and archive records, or permanently delete your account (which also cancels your subscription immediately and deletes your hosted Git data and any unpublished Zenodo drafts). The export does not include repository source code or Git checkpoints; email us if you want a Git bundle of repositories we host for you.
 
 We do not "sell" or "share" personal information as those terms are defined under California law, and we do not discriminate against you for exercising your rights.
 

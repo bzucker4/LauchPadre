@@ -92,6 +92,11 @@ export default function App() {
           setCustomer(null);
           setSessionNotice('');
         }}
+        onAccountDeleted={() => {
+          setCustomer(null);
+          setMode('signin');
+          setSessionNotice('Your account and data were deleted. A confirmation email is on its way.');
+        }}
         onSessionExpired={() => {
           setCustomer(null);
           setSessionNotice('Your session expired. Sign in again to continue.');

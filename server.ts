@@ -10,6 +10,7 @@ import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { CustomerAuth } from './src/customerAuth.ts';
 import { mailerFromEnv, type Mailer } from './src/mailer.ts';
+import { CustomerData } from './src/customerData.ts';
 import { loadLegalPages, legalValuesFromEnv } from './src/legalPages.ts';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
@@ -935,6 +936,56 @@ export async function createApp(options: CreateAppOptions = {}) {
     token: options.zenodoToken,
     baseUrl: options.zenodoBaseUrl,
   });
+
+  const customerData = new CustomerData(workspaceDatabase, customerAuth, customerBilling, checkpoints, zenodo);
+
+  app.get('/api/customer/export', requireCustomer, (_req: Request, res: Response) => {
+    const data = customerData.export(res.locals.customer.id);
+    if (!data) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="launchpadre-export-${data.exported_at.slice(0, 10)}.json"`);
+    res.type('application/json').send(JSON.stringify(data, null, 2));
+  });
+
+  app.post(
+    '/api/customer/delete-account',
+    express.json({ limit: '4kb' }),
+    requireCustomer,
+    authThrottle,
+    async (req: Request, res: Response) => {
+      const { id, email } = res.locals.customer as { id: string; email: string };
+      if (req.body?.confirm !== 'DELETE' || typeof req.body?.password !== 'string') {
+        res.status(400).json({ error: 'Enter your password and type DELETE to confirm' });
+        return;
+      }
+      if (!customerAuth.checkPassword(id, req.body.password)) {
+        res.status(401).json({ error: 'Password is incorrect' });
+        return;
+      }
+      try {
+        await customerData.deleteAccount(id);
+      } catch (error) {
+        console.error('Account deletion failed:', error instanceof Error ? error.message : error);
+        const known = error instanceof ZenodoArchiveError || error instanceof CheckpointError;
+        res.status(known ? error.status : 502).json({
+          error: known
+            ? error.message
+            : 'We could not cancel your subscription, so nothing was deleted. Try again shortly or contact support.',
+        });
+        return;
+      }
+      recordLog('INFO', 'ACCOUNT_DELETED', 200, 'Customer account deleted at the customer\'s request');
+      sendMail(
+        email,
+        'Your LaunchPadre account was deleted',
+        'Your LaunchPadre account, workspace data and subscription have been deleted. Records we must keep for tax or legal reasons, and anything you published to Zenodo, are not affected.\n\nIf you did not request this, contact us immediately.'
+      );
+      res.setHeader('Set-Cookie', `lp_customer=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${production ? '; Secure' : ''}`);
+      res.json({ status: 'deleted' });
+    }
+  );
 
   function checkpointResponse(res: Response, action: () => unknown, status = 200) {
     try {
